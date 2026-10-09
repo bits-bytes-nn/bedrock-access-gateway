@@ -41,5 +41,6 @@ async def chat_completions(
     model = BedrockModel()
     model.validate(chat_request)
     if chat_request.stream:
-        return StreamingResponse(content=model.chat_stream(chat_request), media_type="text/event-stream")
+        # Awaiting first lets request errors return a status code before the stream starts.
+        return StreamingResponse(content=await model.chat_stream(chat_request), media_type="text/event-stream")
     return await model.chat(chat_request)

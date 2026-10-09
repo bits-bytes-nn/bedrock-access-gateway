@@ -5,7 +5,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse
 from mangum import Mangum
 
 from api.routers import chat, embeddings, model
@@ -53,17 +53,16 @@ async def health():
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
-    logger = logging.getLogger(__name__)
-    
-    # Log essential info only - avoid sensitive data and performance overhead
-    logger.warning(
-        "Request validation failed: %s %s - %s", 
-        request.method, 
-        request.url.path,
-        str(exc).split('\n')[0]  # First line only
+    # Report where and why validation failed, without echoing the input values or
+    # the server-side traceback that str(exc) includes.
+    detail = "; ".join(
+        f"{'.'.join(str(loc) for loc in error.get('loc', ()))}: {error.get('msg', 'invalid value')}"
+        for error in exc.errors()
     )
-    
-    return PlainTextResponse(str(exc), status_code=400)
+    logging.getLogger(__name__).warning(
+        "Request validation failed: %s %s - %s", request.method, request.url.path, detail
+    )
+    return JSONResponse({"detail": detail or "Invalid request"}, status_code=400)
 
 
 handler = Mangum(app)

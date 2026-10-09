@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path
+from starlette.concurrency import run_in_threadpool
 
 from api.auth import api_key_auth
 from api.models.bedrock import BedrockModel
@@ -16,24 +17,26 @@ chat_model = BedrockModel()
 
 
 async def validate_model_id(model_id: str):
-    if model_id not in chat_model.list_models():
-        raise HTTPException(status_code=500, detail="Unsupported Model Id")
+    # Refreshing the list calls Bedrock with blocking boto3 calls.
+    if model_id not in await run_in_threadpool(chat_model.list_models):
+        raise HTTPException(status_code=404, detail="Unsupported Model Id")
 
 
 @router.get("", response_model=Models)
 async def list_models():
-    model_list = [Model(id=model_id) for model_id in chat_model.list_models()]
+    model_list = [Model(id=model_id) for model_id in await run_in_threadpool(chat_model.list_models)]
     return Models(data=model_list)
 
 
 @router.get(
-    "/{model_id}",
+    # :path so that application inference profile ARNs, which contain "/", match.
+    "/{model_id:path}",
     response_model=Model,
 )
 async def get_model(
     model_id: Annotated[
         str,
-        Path(description="Model ID", example="anthropic.claude-3-sonnet-20240229-v1:0"),
+        Path(description="Model ID", examples=["anthropic.claude-3-sonnet-20240229-v1:0"]),
     ],
 ):
     await validate_model_id(model_id)

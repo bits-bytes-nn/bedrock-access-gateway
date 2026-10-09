@@ -267,8 +267,10 @@ response = client.chat.completions.create(
         {"role": "system", "content": "You are an expert assistant with knowledge of..."},
         {"role": "user", "content": "Help me with this task"}
     ],
+    # The SDK merges extra_body into the top-level request, so nest it once more
+    # to send the gateway's own "extra_body" field.
     extra_body={
-        "prompt_caching": {"system": True}
+        "extra_body": {"prompt_caching": {"system": True}}
     }
 )
 

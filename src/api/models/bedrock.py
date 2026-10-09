@@ -3,14 +3,15 @@ import json
 import logging
 import time
 from abc import ABC
-from typing import AsyncIterable, Iterable, Literal
+from typing import AsyncIterable, Literal
 
 import boto3
 import numpy as np
 import tiktoken
 from botocore.config import Config
+from botocore.exceptions import ClientError, ParamValidationError
 from fastapi import HTTPException
-from starlette.concurrency import run_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 
 from api.image_url import parse_image_url
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
@@ -23,7 +24,6 @@ from api.schema import (
     Choice,
     ChoiceDelta,
     CompletionTokensDetails,
-    DeveloperMessage,
     Embedding,
     EmbeddingsRequest,
     EmbeddingsResponse,
@@ -36,7 +36,6 @@ from api.schema import (
     ResponseFunction,
     TextContent,
     ToolCall,
-    ToolContent,
     ToolMessage,
     Usage,
     UserMessage,
@@ -45,22 +44,56 @@ from api.setting import (
     AWS_REGION,
     DEBUG,
     DEFAULT_MODEL,
-    ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_APPLICATION_INFERENCE_PROFILES,
+    ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_PROMPT_CACHING,
 )
 
 logger = logging.getLogger(__name__)
 
 config = Config(
-            connect_timeout=60,      # Connection timeout: 60 seconds
-            read_timeout=900,        # Read timeout: 15 minutes (suitable for long streaming responses)
-            retries={
-                'max_attempts': 8,   # Maximum retry attempts
-                'mode': 'adaptive'   # Adaptive retry mode
-            },
-            max_pool_connections=50  # Maximum connection pool size
-        )
+    connect_timeout=60,
+    # Long enough for slow streaming responses; a stalled read is retried, so keep attempts low.
+    read_timeout=900,
+    retries={"max_attempts": 3, "mode": "standard"},
+    max_pool_connections=50,
+)
+
+# Bedrock error codes mapped to the status returned to the caller. The message is
+# passed through only for errors caused by the request itself; others could expose
+# account details (for example the role ARN in an AccessDenied message).
+_CLIENT_ERROR_STATUS = {
+    "ValidationException": (400, True),
+    "ResourceNotFoundException": (404, True),
+    "ThrottlingException": (429, True),
+    "ServiceQuotaExceededException": (429, True),
+    "AccessDeniedException": (403, False),
+    "ModelNotReadyException": (503, False),
+    "ServiceUnavailableException": (503, False),
+    "ModelTimeoutException": (504, False),
+    "ModelErrorException": (502, False),
+}
+
+
+def bedrock_error_to_http(error: Exception, model_id: str) -> HTTPException:
+    """Translate an exception raised by a Bedrock runtime call into an HTTP error."""
+    if isinstance(error, HTTPException):
+        return error
+    if isinstance(error, ParamValidationError):
+        # botocore rejected the request before sending it, e.g. an empty tool name.
+        logger.warning("Invalid Bedrock request for model %s: %s", model_id, error)
+        return HTTPException(status_code=400, detail=str(error))
+    if isinstance(error, ClientError):
+        code = error.response.get("Error", {}).get("Code", "")
+        # Errors raised mid-stream use camelCase codes such as "throttlingException".
+        code = code[:1].upper() + code[1:]
+        status, expose = _CLIENT_ERROR_STATUS.get(code, (500, False))
+        log = logger.warning if status < 500 or status == 503 else logger.error
+        log("Bedrock %s for model %s: %s", code or "error", model_id, error)
+        detail = str(error) if expose else f"Amazon Bedrock request failed ({code or 'UnknownError'})"
+        return HTTPException(status_code=status, detail=detail)
+    logger.error("Bedrock invocation failed for model %s", model_id, exc_info=error)
+    return HTTPException(status_code=500, detail="Internal error while calling Amazon Bedrock")
 
 bedrock_runtime = boto3.client(
     service_name="bedrock-runtime",
@@ -76,6 +109,7 @@ bedrock_client = boto3.client(
 SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     "cohere.embed-multilingual-v3": "Cohere Embed Multilingual",
     "cohere.embed-english-v3": "Cohere Embed English",
+    "cohere.embed-v4:0": "Cohere Embed v4",
     "amazon.titan-embed-text-v1": "Titan Embeddings G1 - Text",
     "amazon.titan-embed-text-v2:0": "Titan Embeddings G2 - Text",
     # Disable Titan embedding.
@@ -114,8 +148,21 @@ NO_SAMPLING_PARAMS_MODELS = {
 # reasoning_effort is mapped to output_config.effort instead of a budget_tokens value
 ADAPTIVE_THINKING_MODELS = NO_SAMPLING_PARAMS_MODELS
 
+# Models that reject forced tool choice ("tool_choice: type "tool" and "any" are not
+# supported"). tool_choice "required" or a named function falls back to auto for them.
+NO_FORCED_TOOL_CHOICE_MODELS = {
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5",
+}
+
 # Bedrock rejects Claude thinking budgets below this value
 MIN_THINKING_BUDGET_TOKENS = 1024
+
+# Remote image urls fetched for a single request. Each fetch has its own deadline,
+# so this bounds how long one request can spend downloading. Converse accepts at
+# most 20 images per request for most models anyway.
+MAX_REMOTE_IMAGES_PER_REQUEST = 20
 
 # Models that don't support assistant message prefill
 # For these models, if conversation ends with assistant message (e.g., "continue response"),
@@ -140,7 +187,9 @@ def list_bedrock_models() -> dict:
         - Cross-Region Inference Profiles (if enabled via Env)
         - Application Inference Profiles (if enabled via Env)
     """
+    global profile_metadata
     model_list = {}
+    metadata = {}
     try:
         if ENABLE_CROSS_REGION_INFERENCE:
             # List system defined inference profile IDs and store underlying model mapping
@@ -158,7 +207,7 @@ def list_bedrock_models() -> dict:
                         if model_arn:
                             # Extract foundation model ID from ARN
                             model_id = model_arn.split('/')[-1]
-                            profile_metadata[profile_id] = {
+                            metadata[profile_id] = {
                                 "underlying_model_id": model_id,
                                 "profile_type": "SYSTEM_DEFINED",
                             }
@@ -189,7 +238,7 @@ def list_bedrock_models() -> dict:
                         model_id = model_arn.split('/')[-1] if '/' in model_arn else model_arn
 
                         # Store in unified profile metadata for feature detection
-                        profile_metadata[profile_arn] = {
+                        metadata[profile_arn] = {
                             "underlying_model_id": model_id,
                             "profile_type": "APPLICATION",
                             "profile_name": profile.get("inferenceProfileName", ""),
@@ -217,12 +266,18 @@ def list_bedrock_models() -> dict:
                 model_list[model_id] = {"modalities": input_modalities}
 
             # Add all inference profiles (cross-region and application) for this model
-            for profile_id, metadata in profile_metadata.items():
-                if metadata.get("underlying_model_id") == model_id:
+            for profile_id, profile in metadata.items():
+                if profile.get("underlying_model_id") == model_id:
                     model_list[profile_id] = {"modalities": input_modalities}
 
     except Exception as e:
-        logger.error(f"Unable to list models: {str(e)}")
+        logger.error("Unable to list models: %s", e)
+        # Keep serving the last good list rather than dropping every model but the default.
+        if bedrock_model_list:
+            return bedrock_model_list
+    else:
+        # Swap in the new mapping in one step so readers never see a partial one.
+        profile_metadata = metadata
 
     if not model_list:
         # In case stack not updated.
@@ -232,10 +287,16 @@ def list_bedrock_models() -> dict:
 
 
 # Initialize the model list.
+bedrock_model_list: dict = {}
 bedrock_model_list = list_bedrock_models()
 
 
 class BedrockModel(BaseChatModel):
+    def __init__(self):
+        # Per-stream state; a new BedrockModel is created for every request.
+        self.think_emitted = False
+        self.tool_call_indexes: dict[int, int] = {}
+
     def list_models(self) -> list[str]:
         """Always refresh the latest model list"""
         global bedrock_model_list
@@ -258,15 +319,6 @@ class BedrockModel(BaseChatModel):
             else:
                 error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
             logger.error("Unsupported model: %s", chat_request.model)
-
-        # Validate profile has resolvable underlying model
-        if not error and chat_request.model in profile_metadata:
-            resolved = self._resolve_to_foundation_model(chat_request.model)
-            if resolved == chat_request.model:
-                logger.warning(
-                    f"Could not resolve profile {chat_request.model} "
-                    f"to underlying model. Some features may not work correctly."
-                )
 
         if error:
             raise HTTPException(
@@ -331,31 +383,6 @@ class BedrockModel(BaseChatModel):
 
         return False
 
-    def _get_max_cache_tokens(self, model_id: str) -> int | None:
-        """
-        Get maximum cacheable tokens limit for the model.
-
-        Different models have different caching limits:
-        - Claude: No explicit limit mentioned in docs
-        - Nova: 20,000 tokens max
-
-        Returns:
-            int | None: Max tokens, or None if unlimited
-        """
-        # Resolve profile to underlying model for feature detection
-        resolved_model = self._resolve_to_foundation_model(model_id)
-        model_lower = resolved_model.lower()
-
-        # Nova models have 20K limit
-        if "amazon.nova" in model_lower:
-            return 20_000
-
-        # Claude: No explicit limit
-        if "anthropic.claude" in model_lower:
-            return None
-
-        return None
-
     async def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
         if DEBUG:
@@ -369,30 +396,21 @@ class BedrockModel(BaseChatModel):
                     f"Profile resolution: {chat_request.model} ({profile_type}) → {resolved}"
                 )
 
-        # convert OpenAI chat request to Bedrock SDK request
-        args = self._parse_request(chat_request)
+        # Convert the OpenAI request to a Bedrock request. This can fetch remote
+        # images, so it runs in the thread pool to keep the event loop free.
+        try:
+            args = await run_in_threadpool(self._parse_request, chat_request)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Tool call arguments must be valid JSON: {e}")
         if DEBUG:
             logger.info("Bedrock request: " + json.dumps(str(args)))
 
         try:
             if stream:
-                # Run the blocking boto3 call in a thread pool
-                response = await run_in_threadpool(
-                    bedrock_runtime.converse_stream, **args
-                )
-            else:
-                # Run the blocking boto3 call in a thread pool
-                response = await run_in_threadpool(bedrock_runtime.converse, **args)
-        except bedrock_runtime.exceptions.ValidationException as e:
-            logger.error("Bedrock validation error for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=400, detail=str(e))
-        except bedrock_runtime.exceptions.ThrottlingException as e:
-            logger.warning("Bedrock throttling for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=429, detail=str(e))
+                return await run_in_threadpool(bedrock_runtime.converse_stream, **args)
+            return await run_in_threadpool(bedrock_runtime.converse, **args)
         except Exception as e:
-            logger.error("Bedrock invocation failed for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=500, detail=str(e))
-        return response
+            raise bedrock_error_to_http(e, chat_request.model)
 
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
         """Default implementation for Chat API."""
@@ -432,29 +450,33 @@ class BedrockModel(BaseChatModel):
             logger.info("Proxy response :" + chat_response.model_dump_json())
         return chat_response
 
-    async def _async_iterate(self, stream):
-        """Helper method to convert sync iterator to async iterator"""
-        for chunk in stream:
-            await run_in_threadpool(lambda: chunk)
-            yield chunk
-
     async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
-        """Default implementation for Chat Stream API"""
+        """Start a streaming chat completion.
+
+        Bedrock is called before the first event is produced, so request errors are
+        raised here and returned with a proper status code instead of inside a 200 stream.
+        """
+        response = await self._invoke_bedrock(chat_request, stream=True)
+        return self._stream_events(chat_request, response["stream"])
+
+    async def _stream_events(self, chat_request: ChatRequest, stream) -> AsyncIterable[bytes]:
+        """Translate a Bedrock event stream into OpenAI server-sent events."""
+        message_id = self.generate_message_id()
+        self.think_emitted = False
+        self.tool_call_indexes = {}
+        reasoning_tokens = 0
         try:
-            response = await self._invoke_bedrock(chat_request, stream=True)
-            message_id = self.generate_message_id()
-            stream = response.get("stream")
-            self.think_emitted = False
-            reasoning_tokens = 0
-            async for chunk in self._async_iterate(stream):
+            # Reading the next event blocks on the socket, so do it in the thread pool.
+            async for chunk in iterate_in_threadpool(stream):
                 # Accumulate reasoning tokens from delta chunks before processing
                 if "contentBlockDelta" in chunk:
                     delta = chunk["contentBlockDelta"].get("delta", {})
                     if "reasoningContent" in delta and "text" in delta["reasoningContent"]:
                         reasoning_tokens += len(ENCODER.encode(delta["reasoningContent"]["text"]))
 
-                args = {"model_id": chat_request.model, "message_id": message_id, "chunk": chunk}
-                stream_response = self._create_response_stream(**args)
+                stream_response = self._create_response_stream(
+                    model_id=chat_request.model, message_id=message_id, chunk=chunk
+                )
                 if not stream_response:
                     continue
 
@@ -480,11 +502,25 @@ class BedrockModel(BaseChatModel):
 
             # return an [DONE] message at the end.
             yield self.stream_response_to_bytes()
-            self.think_emitted = False  # Cleanup
         except Exception as e:
-            logger.error("Stream error for model %s: %s", chat_request.model, str(e))
-            error_event = Error(error=ErrorMessage(message=str(e)))
-            yield self.stream_response_to_bytes(error_event)
+            # Headers are already sent, so the error can only be reported as an event.
+            error = bedrock_error_to_http(e, chat_request.model)
+            yield self.stream_response_to_bytes(Error(error=ErrorMessage(message=str(error.detail))))
+        finally:
+            # Also runs when the client disconnects, so the Bedrock connection is not left open.
+            close = getattr(stream, "close", None)
+            if close:
+                close()
+
+    @staticmethod
+    def _prompt_caching_override(chat_request: ChatRequest, key: str) -> bool | None:
+        """Return the per-request prompt caching override for ``key`` ("system" or "messages"), if any."""
+        if not isinstance(chat_request.extra_body, dict):
+            return None
+        prompt_caching = chat_request.extra_body.get("prompt_caching")
+        if not isinstance(prompt_caching, dict) or key not in prompt_caching:
+            return None
+        return prompt_caching[key] is True
 
     def _parse_system_prompts(self, chat_request: ChatRequest) -> list[dict[str, str]]:
         """Create system prompts with optional prompt caching support.
@@ -496,7 +532,7 @@ class BedrockModel(BaseChatModel):
         Only adds cachePoint if:
         - Model supports caching (Claude, Nova)
         - Caching is enabled (ENV or extra_body)
-        - System prompts exist and meet minimum token requirements
+        - System prompts exist
 
         Example output: [{"text" : system_prompt}, {"cachePoint": {"type": "default"}}]
 
@@ -506,9 +542,11 @@ class BedrockModel(BaseChatModel):
         for message in chat_request.messages:
             if message.role not in ("system", "developer"):
                 continue
-            if not isinstance(message.content, str):
-                raise TypeError(f"System message content must be a string, got {type(message.content).__name__}")
-            system_prompts.append({"text": message.content})
+            if isinstance(message.content, str):
+                text = message.content
+            else:
+                text = "\n".join(part.text for part in message.content)
+            system_prompts.append({"text": text})
 
         if not system_prompts:
             return system_prompts
@@ -517,31 +555,11 @@ class BedrockModel(BaseChatModel):
         if not self._supports_prompt_caching(chat_request.model):
             return system_prompts
 
-        # Determine if caching should be enabled
-        cache_enabled = ENABLE_PROMPT_CACHING  # Default from ENV
-
-        # Check for extra_body override
-        if chat_request.extra_body and isinstance(chat_request.extra_body, dict):
-            prompt_caching = chat_request.extra_body.get("prompt_caching", {})
-            if "system" in prompt_caching:
-                # extra_body explicitly controls caching
-                cache_enabled = prompt_caching.get("system") is True
-
+        # extra_body.prompt_caching.system overrides the ENABLE_PROMPT_CACHING default
+        override = self._prompt_caching_override(chat_request, "system")
+        cache_enabled = ENABLE_PROMPT_CACHING if override is None else override
         if not cache_enabled:
             return system_prompts
-
-        # Estimate total tokens for limit check
-        total_text = " ".join(p.get("text", "") for p in system_prompts)
-        estimated_tokens = len(total_text.split()) * 1.3  # Rough estimate
-
-        # Check token limits (Nova has 20K limit)
-        max_tokens = self._get_max_cache_tokens(chat_request.model)
-        if max_tokens and estimated_tokens > max_tokens:
-            logger.warning(
-                f"System prompts (~{estimated_tokens:.0f} tokens) exceed model cache limit ({max_tokens} tokens). "
-                f"Caching will still be attempted but may not work optimally."
-            )
-            # Still add cachePoint - let Bedrock handle the limit
 
         # Add cache checkpoint after system prompts
         system_prompts.append({"cachePoint": {"type": "default"}})
@@ -597,7 +615,8 @@ class BedrockModel(BaseChatModel):
                 if message.tool_calls:
                     # Tool use message
                     for tool_call in message.tool_calls:
-                        tool_input = json.loads(tool_call.function.arguments)
+                        arguments = tool_call.function.arguments
+                        tool_input = json.loads(arguments) if arguments and arguments.strip() else {}
                         messages.append(
                             {
                                 "role": message.role,
@@ -768,13 +787,9 @@ class BedrockModel(BaseChatModel):
             if not self._supports_prompt_caching(chat_request.model):
                 return reformatted_messages
 
-            # Determine if messages caching should be enabled
-            cache_enabled = ENABLE_PROMPT_CACHING
-
-            if chat_request.extra_body and isinstance(chat_request.extra_body, dict):
-                prompt_caching = chat_request.extra_body.get("prompt_caching", {})
-                if "messages" in prompt_caching:
-                    cache_enabled = prompt_caching.get("messages") is True
+            # extra_body.prompt_caching.messages overrides the ENABLE_PROMPT_CACHING default
+            override = self._prompt_caching_override(chat_request, "messages")
+            cache_enabled = ENABLE_PROMPT_CACHING if override is None else override
 
             if cache_enabled:
                 # Add cachePoint to the last user message content
@@ -795,6 +810,18 @@ class BedrockModel(BaseChatModel):
 
         Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
         """
+        remote_images = sum(
+            1
+            for message in chat_request.messages
+            if isinstance(message, (UserMessage, AssistantMessage)) and isinstance(message.content, list)
+            for part in message.content
+            if isinstance(part, ImageContent) and not part.image_url.url.startswith("data:")
+        )
+        if remote_images > MAX_REMOTE_IMAGES_PER_REQUEST:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A request may reference at most {MAX_REMOTE_IMAGES_PER_REQUEST} remote image urls",
+            )
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
@@ -847,10 +874,6 @@ class BedrockModel(BaseChatModel):
         if chat_request.reasoning_effort:
             # reasoning_effort is supported by Claude and DeepSeek v3
             # Different models use different formats
-            # Resolve profile to underlying model for feature detection
-            resolved_model = self._resolve_to_foundation_model(chat_request.model)
-            model_lower = resolved_model.lower()
-
             if "anthropic.claude" in model_lower and any(
                 model in model_lower for model in ADAPTIVE_THINKING_MODELS
             ):
@@ -895,11 +918,17 @@ class BedrockModel(BaseChatModel):
                 if DEBUG:
                     logger.info(f"reasoning_effort parameter ignored for model {chat_request.model} (not supported)")
         # add tool config
-        if chat_request.tools:
+        # Converse has no "none" tool choice. Leaving tools out is the closest match, but
+        # Bedrock requires the tool config whenever the history contains tool blocks.
+        skip_tools = chat_request.tool_choice == "none" and not self._has_tool_blocks(messages)
+        if chat_request.tools and not skip_tools:
             tool_config = {"tools": [self._convert_tool_spec(t.function) for t in chat_request.tools]}
 
-            if chat_request.tool_choice and not chat_request.model.startswith(
-                "meta.llama3-1-"
+            # Llama 3.1 rejects toolChoice; "none" cannot be expressed, so it falls back to auto.
+            if (
+                chat_request.tool_choice
+                and chat_request.tool_choice != "none"
+                and "meta.llama3-1-" not in model_lower
             ):
                 if isinstance(chat_request.tool_choice, str):
                     # auto (default) is mapped to {"auto" : {}}
@@ -910,9 +939,17 @@ class BedrockModel(BaseChatModel):
                         tool_config["toolChoice"] = {"auto": {}}
                 else:
                     # Specific tool to use
-                    if "function" not in chat_request.tool_choice:
-                        raise ValueError("tool_choice must contain 'function' key when specifying a specific tool")
+                    if not isinstance(chat_request.tool_choice, dict) or "function" not in chat_request.tool_choice:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="tool_choice must contain 'function' key when specifying a specific tool",
+                        )
                     tool_config["toolChoice"] = {"tool": {"name": chat_request.tool_choice["function"].get("name", "")}}
+
+                forced = "any" in tool_config["toolChoice"] or "tool" in tool_config["toolChoice"]
+                if forced and any(model in model_lower for model in NO_FORCED_TOOL_CHOICE_MODELS):
+                    logger.warning("%s does not support forced tool choice, using auto", chat_request.model)
+                    tool_config["toolChoice"] = {"auto": {}}
             args["toolConfig"] = tool_config
         # Add additional fields to enable extend thinking or other model-specific features
         if chat_request.extra_body:
@@ -934,6 +971,14 @@ class BedrockModel(BaseChatModel):
                     inference_config.pop("topP", None)
 
         return args
+
+    @staticmethod
+    def _has_tool_blocks(messages: list[dict]) -> bool:
+        return any(
+            "toolUse" in block or "toolResult" in block
+            for message in messages
+            for block in message["content"]
+        )
 
     def _estimate_reasoning_tokens(self, content: list[dict]) -> int:
         """
@@ -968,41 +1013,40 @@ class BedrockModel(BaseChatModel):
         message = ChatResponseMessage(
             role="assistant",
         )
-        if finish_reason == "tool_use":
-            # https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html#tool-use-examples
-            tool_calls = []
-            for part in content:
-                if "toolUse" in part:
-                    tool = part["toolUse"]
-                    tool_calls.append(
-                        ToolCall(
-                            id=tool["toolUseId"],
-                            type="function",
-                            function=ResponseFunction(
-                                name=tool["name"],
-                                arguments=json.dumps(tool["input"]),
-                            ),
-                        )
+        # A response can hold several text blocks, reasoning, and tool calls together.
+        text_parts = []
+        reasoning_parts = []
+        tool_calls = []
+        for part in content or []:
+            if "text" in part:
+                text_parts.append(part["text"])
+            elif "reasoningContent" in part:
+                # redactedContent is encrypted and has no text to surface
+                reasoning_parts.append(part["reasoningContent"].get("reasoningText", {}).get("text", ""))
+            elif "toolUse" in part:
+                tool = part["toolUse"]
+                tool_calls.append(
+                    ToolCall(
+                        id=tool["toolUseId"],
+                        type="function",
+                        function=ResponseFunction(
+                            name=tool["name"],
+                            arguments=json.dumps(tool["input"]),
+                        ),
                     )
+                )
+            else:
+                logger.warning("Unknown tag in message content " + ",".join(part.keys()))
+
+        text = "".join(text_parts)
+        reasoning = "".join(reasoning_parts)
+        if reasoning:
+            text = f"<think>{reasoning}</think>{text}"
+        if tool_calls:
             message.tool_calls = tool_calls
-            message.content = None
+            message.content = text or None
         else:
-            message.content = ""
-            for c in content:
-                if "reasoningContent" in c:
-                    # redactedContent is encrypted and has no text to surface
-                    message.reasoning_content = c["reasoningContent"].get(
-                        "reasoningText", {}
-                    ).get("text", "")
-                elif "text" in c:
-                    message.content = c["text"]
-                else:
-                    logger.warning(
-                        "Unknown tag in message content " + ",".join(c.keys())
-                    )
-            if message.reasoning_content:
-                message.content = f"<think>{message.reasoning_content}</think>{message.content}"
-                message.reasoning_content = None
+            message.content = text
 
         # Create prompt_tokens_details if cache metrics are available
         prompt_tokens_details = None
@@ -1071,8 +1115,9 @@ class BedrockModel(BaseChatModel):
             # tool call start
             delta = chunk["contentBlockStart"]["start"]
             if "toolUse" in delta:
-                # first index is content
-                index = chunk["contentBlockStart"]["contentBlockIndex"] - 1
+                # OpenAI tool call indexes count tool calls only, starting at 0.
+                block_index = chunk["contentBlockStart"]["contentBlockIndex"]
+                index = self.tool_call_indexes.setdefault(block_index, len(self.tool_call_indexes))
                 message = ChatResponseMessage(
                     tool_calls=[
                         ToolCall(
@@ -1086,6 +1131,10 @@ class BedrockModel(BaseChatModel):
                         )
                     ]
                 )
+                # Close an open reasoning block before the tool call starts.
+                closing_tag = self._close_think_tag()
+                if closing_tag:
+                    message.content = closing_tag
 
         if "contentBlockDelta" in chunk:
             delta = chunk["contentBlockDelta"]["delta"]
@@ -1114,9 +1163,9 @@ class BedrockModel(BaseChatModel):
                         return None  # Ignore signature if no <think> started
                 else:
                     return None  # e.g. encrypted redactedContent, nothing to surface
-            else:
-                # tool use
-                index = chunk["contentBlockDelta"]["contentBlockIndex"] - 1
+            elif "toolUse" in delta:
+                block_index = chunk["contentBlockDelta"]["contentBlockIndex"]
+                index = self.tool_call_indexes.setdefault(block_index, len(self.tool_call_indexes))
                 message = ChatResponseMessage(
                     tool_calls=[
                         ToolCall(
@@ -1129,22 +1178,9 @@ class BedrockModel(BaseChatModel):
                 )
 
         if "messageStop" in chunk:
-            # Safety check: Close any open thinking tags before message stops
-            if self.think_emitted:
-                self.think_emitted = False
-                return ChatStreamResponse(
-                    id=message_id,
-                    model=model_id,
-                    choices=[
-                        ChoiceDelta(
-                            index=0,
-                            delta=ChatResponseMessage(content="</think>"),
-                            logprobs=None,
-                            finish_reason=None,
-                        )
-                    ],
-                )
-            message = ChatResponseMessage()
+            # Close any open reasoning block in the same chunk that carries finish_reason.
+            closing_tag = self._close_think_tag()
+            message = ChatResponseMessage(content=closing_tag) if closing_tag else ChatResponseMessage()
             finish_reason = chunk["messageStop"]["stopReason"]
 
         if "metadata" in chunk:
@@ -1201,6 +1237,13 @@ class BedrockModel(BaseChatModel):
             )
 
         return None
+
+    def _close_think_tag(self) -> str | None:
+        """Return the closing reasoning tag if a reasoning block is open, and mark it closed."""
+        if not self.think_emitted:
+            return None
+        self.think_emitted = False
+        return "</think>"
 
     def _parse_image(self, image_url: str) -> tuple[bytes, str]:
         """Try to get the raw data from an image url.
@@ -1263,29 +1306,29 @@ class BedrockModel(BaseChatModel):
         return False
 
     def _convert_tool_spec(self, func: Function) -> dict:
-        return {
-            "toolSpec": {
-                "name": func.name,
-                "description": func.description,
-                "inputSchema": {
-                    "json": func.parameters,
-                },
-            }
+        tool_spec = {
+            "name": func.name,
+            # OpenAI allows omitting parameters for a function that takes none.
+            "inputSchema": {"json": func.parameters or {"type": "object", "properties": {}}},
         }
+        # description is optional in OpenAI, but Converse rejects a null value.
+        if func.description:
+            tool_spec["description"] = func.description
+        return {"toolSpec": tool_spec}
 
     def _calc_budget_tokens(
         self, max_tokens: int, reasoning_effort: Literal["low", "medium", "high"]
     ) -> int:
         # Helper function to calculate budget_tokens based on the max_tokens.
-        # Ratio for efforts:  Low - 30%, medium - 60%, High: Max token - 1
-        # Note that The minimum budget_tokens is 1,024 tokens so far.
-        # But it may be changed for different models in the future.
+        # Ratio for efforts: low - 30%, medium - 60%, high - 80%. High leaves room for
+        # the answer; spending almost all of max_tokens on thinking returns empty content.
+        # The caller raises the result to the 1,024 token minimum.
         if reasoning_effort == "low":
             return int(max_tokens * 0.3)
         elif reasoning_effort == "medium":
             return int(max_tokens * 0.6)
         else:
-            return max_tokens - 1
+            return int(max_tokens * 0.8)
 
     def _convert_finish_reason(self, finish_reason: str | None) -> str | None:
         """
@@ -1315,6 +1358,41 @@ class BedrockModel(BaseChatModel):
 class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
     accept = "application/json"
     content_type = "application/json"
+    # Same cap as the OpenAI embeddings API.
+    MAX_INPUTS = 2048
+
+    def _input_texts(self, embeddings_request: EmbeddingsRequest) -> list[str]:
+        """Normalize the OpenAI ``input`` field to a list of texts.
+
+        A list of ints is a single tokenized input and a list of lists is a batch of
+        them; token ids are decoded with tiktoken since Bedrock only accepts text.
+        """
+        value = embeddings_request.input
+        if isinstance(value, str):
+            texts = [value]
+        elif not value:
+            raise HTTPException(status_code=400, detail="Input cannot be empty")
+        elif isinstance(value[0], int):
+            texts = [ENCODER.decode(value)]
+        elif isinstance(value[0], list):
+            texts = [ENCODER.decode(tokens) for tokens in value]
+        else:
+            texts = list(value)
+
+        if len(texts) > self.MAX_INPUTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input must not contain more than {self.MAX_INPUTS} items",
+            )
+        return texts
+
+    @staticmethod
+    def _reject_dimensions(embeddings_request: EmbeddingsRequest) -> None:
+        if embeddings_request.dimensions is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"dimensions is not supported by {embeddings_request.model}",
+            )
 
     def _invoke_model(self, args: dict, model_id: str):
         body = json.dumps(args)
@@ -1328,19 +1406,12 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
                 accept=self.accept,
                 contentType=self.content_type,
             )
-        except bedrock_runtime.exceptions.ValidationException as e:
-            logger.error("Validation Error: " + str(e))
-            raise HTTPException(status_code=400, detail=str(e))
-        except bedrock_runtime.exceptions.ThrottlingException as e:
-            logger.error("Throttling Error: " + str(e))
-            raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
-            logger.error(e)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise bedrock_error_to_http(e, model_id)
 
     def _create_response(
         self,
-        embeddings: list[float],
+        embeddings: list[list[float]],
         model: str,
         input_tokens: int = 0,
         output_tokens: int = 0,
@@ -1369,95 +1440,91 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
 
 
 class CohereEmbeddingsModel(BedrockEmbeddingsModel):
-    def _parse_args(self, embeddings_request: EmbeddingsRequest) -> dict:
-        texts = []
-        if isinstance(embeddings_request.input, str):
-            texts = [embeddings_request.input]
-        elif isinstance(embeddings_request.input, list):
-            texts = embeddings_request.input
-        elif isinstance(embeddings_request.input, Iterable):
-            # For encoded input
-            # The workaround is to use tiktoken to decode to get the original text.
-            encodings = []
-            for inner in embeddings_request.input:
-                if isinstance(inner, int):
-                    # Iterable[int]
-                    encodings.append(inner)
-                else:
-                    # Iterable[Iterable[int]]
-                    text = ENCODER.decode(list(inner))
-                    texts.append(text)
-            if encodings:
-                texts.append(ENCODER.decode(encodings))
+    # Bedrock accepts at most 96 texts per Cohere Embed request.
+    BATCH_SIZE = 96
+    # Embed v4 output sizes; v3 has a fixed size.
+    V4_DIMENSIONS = {256, 512, 1024, 1536}
 
-        # Maximum of 2048 characters
+    def __init__(self, is_v4: bool = False):
+        self.is_v4 = is_v4
+
+    def _parse_args(self, texts: list[str], dimensions: int | None) -> dict:
         args = {
             "texts": texts,
             "input_type": "search_document",
-            "truncate": "END",  # "NONE|START|END"
+            # Inputs longer than the model limit are cut from the end.
+            "truncate": "END",
         }
+        if self.is_v4:
+            args["embedding_types"] = ["float"]
+            if dimensions is not None:
+                args["output_dimension"] = dimensions
         return args
 
     def embed(self, embeddings_request: EmbeddingsRequest) -> EmbeddingsResponse:
-        response = self._invoke_model(
-            args=self._parse_args(embeddings_request), model_id=embeddings_request.model
-        )
-        response_body = json.loads(response.get("body").read())
-        if DEBUG:
-            logger.info("Bedrock response body: " + str(response_body))
+        dimensions = embeddings_request.dimensions
+        if not self.is_v4:
+            self._reject_dimensions(embeddings_request)
+        elif dimensions is not None and dimensions not in self.V4_DIMENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid dimensions {dimensions}. Must be one of {sorted(self.V4_DIMENSIONS)}",
+            )
+        texts = self._input_texts(embeddings_request)
+
+        all_embeddings = []
+        total_tokens = 0
+        for start in range(0, len(texts), self.BATCH_SIZE):
+            response = self._invoke_model(
+                args=self._parse_args(texts[start : start + self.BATCH_SIZE], dimensions),
+                model_id=embeddings_request.model,
+            )
+            response_body = json.loads(response.get("body").read())
+            if DEBUG:
+                logger.info("Bedrock response body: " + str(response_body))
+            embeddings = response_body["embeddings"]
+            # v4 (and v3 with embedding_types) returns {"float": [...]} instead of a list.
+            all_embeddings.extend(embeddings["float"] if isinstance(embeddings, dict) else embeddings)
+            # Cohere reports usage only in the response headers.
+            headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+            total_tokens += int(headers.get("x-amzn-bedrock-input-token-count", 0))
 
         return self._create_response(
-            embeddings=response_body["embeddings"],
+            embeddings=all_embeddings,
             model=embeddings_request.model,
+            input_tokens=total_tokens,
             encoding_format=embeddings_request.encoding_format,
         )
 
 
 class TitanEmbeddingsModel(BedrockEmbeddingsModel):
-    def _parse_args(self, input_text: str, embeddings_request: EmbeddingsRequest) -> dict:
-        args = {
-            "inputText": input_text,
-            # Note: inputImage is not supported!
-        }
-        if embeddings_request.model == "amazon.titan-embed-image-v1":
-            args["embeddingConfig"] = (
-                embeddings_request.embedding_config
-                if embeddings_request.embedding_config
-                else {"outputEmbeddingLength": 1024}
-            )
+    # Titan Text Embeddings V2 output sizes; V1 has a fixed size.
+    V2_MODEL_ID = "amazon.titan-embed-text-v2:0"
+    V2_DIMENSIONS = {256, 512, 1024}
+
+    def _parse_args(self, input_text: str, dimensions: int | None) -> dict:
+        args = {"inputText": input_text}
+        if dimensions is not None:
+            args["dimensions"] = dimensions
         return args
 
     def embed(self, embeddings_request: EmbeddingsRequest) -> EmbeddingsResponse:
-        # Titan's Bedrock API accepts only a single string per InvokeModel call, but
-        # the OpenAI embeddings contract allows a list. Normalize to a list of texts
-        # and loop so batched callers (e.g. memory indexers) work transparently.
-        if isinstance(embeddings_request.input, str):
-            texts = [embeddings_request.input]
-        elif isinstance(embeddings_request.input, list):
-            if len(embeddings_request.input) == 0:
-                raise HTTPException(status_code=400, detail="Input list cannot be empty")
-            # Decode token arrays if needed (OpenAI clients may send token ids)
-            texts = []
-            for item in embeddings_request.input:
-                if isinstance(item, str):
-                    texts.append(item)
-                elif isinstance(item, int):
-                    texts.append(ENCODER.decode([item]))
-                elif isinstance(item, list):
-                    texts.append(ENCODER.decode(item))
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unsupported input item type: {type(item).__name__}. Expected str, int, or list of ints.",
-                    )
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported input type")
+        dimensions = embeddings_request.dimensions
+        if not embeddings_request.model.endswith(self.V2_MODEL_ID):
+            self._reject_dimensions(embeddings_request)
+        elif dimensions is not None and dimensions not in self.V2_DIMENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid dimensions {dimensions}. Must be one of {sorted(self.V2_DIMENSIONS)}",
+            )
 
+        # Titan takes a single text per InvokeModel call, while the OpenAI contract
+        # allows a list, so embed the items one by one.
         all_embeddings = []
         total_tokens = 0
-        for text in texts:
+        for text in self._input_texts(embeddings_request):
             response = self._invoke_model(
-                args=self._parse_args(text, embeddings_request),
+                args=self._parse_args(text, dimensions),
                 model_id=embeddings_request.model,
             )
             response_body = json.loads(response.get("body").read())
@@ -1479,15 +1546,14 @@ class NovaEmbeddingsModel(BedrockEmbeddingsModel):
     VALID_DIMENSIONS = {256, 384, 1024, 3072}
     DEFAULT_DIMENSION = 3072
 
-    def _parse_args(self, text: str, dimensions: int | None = None) -> dict:
-        dim = dimensions if dimensions is not None else self.DEFAULT_DIMENSION
+    def _parse_args(self, text: str, dimension: int) -> dict:
         return {
             "taskType": "SINGLE_EMBEDDING",
             "singleEmbeddingParams": {
                 # Nova supports 9 embeddingPurpose values; GENERIC_INDEX is the
                 # general-purpose default suitable for most retrieval use cases.
                 "embeddingPurpose": "GENERIC_INDEX",
-                "embeddingDimension": dim,
+                "embeddingDimension": dimension,
                 "text": {
                     "truncationMode": "END",
                     "value": text,
@@ -1496,43 +1562,18 @@ class NovaEmbeddingsModel(BedrockEmbeddingsModel):
         }
 
     def embed(self, embeddings_request: EmbeddingsRequest) -> EmbeddingsResponse:
-        if isinstance(embeddings_request.input, str):
-            texts = [embeddings_request.input]
-        elif isinstance(embeddings_request.input, list):
-            if len(embeddings_request.input) == 0:
-                raise HTTPException(status_code=400, detail="Input list cannot be empty")
-            # Decode token arrays if needed
-            texts = []
-            for item in embeddings_request.input:
-                if isinstance(item, str):
-                    texts.append(item)
-                elif isinstance(item, int):
-                    texts.append(ENCODER.decode([item]))
-                elif isinstance(item, list):
-                    texts.append(ENCODER.decode(item))
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unsupported input item type: {type(item).__name__}. Expected str, int, or list of ints.",
-                    )
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported input type")
-
-        dimensions = embeddings_request.dimensions
-        # Validate dimensions once before the loop — it's constant across all texts
-        dim = dimensions if dimensions is not None else self.DEFAULT_DIMENSION
-        if dim not in self.VALID_DIMENSIONS:
+        dimension = embeddings_request.dimensions or self.DEFAULT_DIMENSION
+        if dimension not in self.VALID_DIMENSIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid dimensions {dim}. Must be one of {sorted(self.VALID_DIMENSIONS)}",
+                detail=f"Invalid dimensions {dimension}. Must be one of {sorted(self.VALID_DIMENSIONS)}",
             )
 
         all_embeddings = []
         total_tokens = 0
-
-        for idx, text in enumerate(texts):
+        for idx, text in enumerate(self._input_texts(embeddings_request)):
             response = self._invoke_model(
-                args=self._parse_args(text, dimensions),
+                args=self._parse_args(text, dimension),
                 model_id=embeddings_request.model,
             )
             response_body = json.loads(response.get("body").read())
@@ -1543,7 +1584,7 @@ class NovaEmbeddingsModel(BedrockEmbeddingsModel):
             embeddings_list = response_body.get("embeddings", [])
             if not embeddings_list:
                 raise HTTPException(
-                    status_code=500,
+                    status_code=502,
                     detail=f"No embeddings returned from Nova model for input[{idx}]",
                 )
             all_embeddings.append(embeddings_list[0]["embedding"])
@@ -1558,13 +1599,24 @@ class NovaEmbeddingsModel(BedrockEmbeddingsModel):
         )
 
 
+# Inference profile prefixes, e.g. global.cohere.embed-v4:0 for a model only served through a profile.
+_PROFILE_PREFIXES = ("global.", "us.", "eu.", "apac.", "jp.", "au.", "ca.", "us-gov.")
+
+
 def get_embeddings_model(model_id: str) -> BedrockEmbeddingsModel:
-    model_name = SUPPORTED_BEDROCK_EMBEDDING_MODELS.get(model_id, "")
+    base_model_id = model_id
+    for prefix in _PROFILE_PREFIXES:
+        if model_id.startswith(prefix):
+            base_model_id = model_id[len(prefix) :]
+            break
+    model_name = SUPPORTED_BEDROCK_EMBEDDING_MODELS.get(base_model_id, "")
     if DEBUG:
         logger.info("model name is " + model_name)
     match model_name:
         case "Cohere Embed Multilingual" | "Cohere Embed English":
             return CohereEmbeddingsModel()
+        case "Cohere Embed v4":
+            return CohereEmbeddingsModel(is_v4=True)
         case "Titan Embeddings G1 - Text" | "Titan Embeddings G2 - Text":
             return TitanEmbeddingsModel()
         case "Nova Multimodal Embeddings V2":

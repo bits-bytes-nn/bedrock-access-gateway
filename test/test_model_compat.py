@@ -28,9 +28,7 @@ PREFILL = [
 
 @pytest.fixture
 def gateway():
-    m = BedrockModel()
-    m.think_emitted = False
-    return m
+    return BedrockModel()
 
 
 def build(gateway, **kwargs):

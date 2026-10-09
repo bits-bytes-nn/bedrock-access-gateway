@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends
+from starlette.concurrency import run_in_threadpool
 
 from api.auth import api_key_auth
 from api.models.bedrock import get_embeddings_model
@@ -31,4 +32,5 @@ async def embeddings(
         embeddings_request.model = DEFAULT_EMBEDDING_MODEL
     # Exception will be raised if model not supported.
     model = get_embeddings_model(embeddings_request.model)
-    return model.embed(embeddings_request)
+    # boto3 calls block, so run them off the event loop.
+    return await run_in_threadpool(model.embed, embeddings_request)

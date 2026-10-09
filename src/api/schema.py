@@ -1,5 +1,5 @@
 import time
-from typing import Iterable, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -53,7 +53,7 @@ class ToolContent(BaseModel):
 class SystemMessage(BaseModel):
     name: str | None = None
     role: Literal["system"] = "system"
-    content: str
+    content: str | list[TextContent]
 
 
 class UserMessage(BaseModel):
@@ -78,13 +78,13 @@ class ToolMessage(BaseModel):
 class DeveloperMessage(BaseModel):
     name: str | None = None
     role: Literal["developer"] = "developer"
-    content: str
+    content: str | list[TextContent]
 
 
 class Function(BaseModel):
     name: str
     description: str | None = None
-    parameters: object
+    parameters: dict | None = None
 
 
 class Tool(BaseModel):
@@ -179,10 +179,11 @@ class ChatStreamResponse(BaseChatResponse):
 
 
 class EmbeddingsRequest(BaseModel):
-    input: str | list[str] | Iterable[int | Iterable[int]]
+    # A string, a batch of strings, one tokenized input, or a batch of tokenized inputs.
+    input: str | list[str] | list[int] | list[list[int]]
     model: str
     encoding_format: Literal["float", "base64"] = "float"
-    dimensions: int | None = None  # Used by Nova embeddings; ignored by other models.
+    dimensions: int | None = Field(default=None, ge=1)  # Titan Text V2 and Nova only.
     user: str | None = None  # not used.
 
 
