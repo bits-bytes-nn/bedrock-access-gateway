@@ -1366,18 +1366,7 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
 
 
 class TitanEmbeddingsModel(BedrockEmbeddingsModel):
-    def _parse_args(self, embeddings_request: EmbeddingsRequest) -> dict:
-        if isinstance(embeddings_request.input, str):
-            input_text = embeddings_request.input
-        elif (
-            isinstance(embeddings_request.input, list)
-            and len(embeddings_request.input) == 1
-        ):
-            input_text = embeddings_request.input[0]
-        else:
-            raise ValueError(
-                "Amazon Titan Embeddings models support only single strings as input."
-            )
+    def _parse_args(self, input_text: str, embeddings_request: EmbeddingsRequest) -> dict:
         args = {
             "inputText": input_text,
             # Note: inputImage is not supported!
@@ -1391,17 +1380,49 @@ class TitanEmbeddingsModel(BedrockEmbeddingsModel):
         return args
 
     def embed(self, embeddings_request: EmbeddingsRequest) -> EmbeddingsResponse:
-        response = self._invoke_model(
-            args=self._parse_args(embeddings_request), model_id=embeddings_request.model
-        )
-        response_body = json.loads(response.get("body").read())
-        if DEBUG:
-            logger.info("Bedrock response body: " + str(response_body))
+        # Titan's Bedrock API accepts only a single string per InvokeModel call, but
+        # the OpenAI embeddings contract allows a list. Normalize to a list of texts
+        # and loop so batched callers (e.g. memory indexers) work transparently.
+        if isinstance(embeddings_request.input, str):
+            texts = [embeddings_request.input]
+        elif isinstance(embeddings_request.input, list):
+            if len(embeddings_request.input) == 0:
+                raise HTTPException(status_code=400, detail="Input list cannot be empty")
+            # Decode token arrays if needed (OpenAI clients may send token ids)
+            texts = []
+            for item in embeddings_request.input:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, int):
+                    texts.append(ENCODER.decode([item]))
+                elif isinstance(item, list):
+                    texts.append(ENCODER.decode(item))
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported input item type: {type(item).__name__}. Expected str, int, or list of ints.",
+                    )
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported input type")
+
+        all_embeddings = []
+        total_tokens = 0
+        for text in texts:
+            response = self._invoke_model(
+                args=self._parse_args(text, embeddings_request),
+                model_id=embeddings_request.model,
+            )
+            response_body = json.loads(response.get("body").read())
+            if DEBUG:
+                logger.info("Bedrock response body: " + str(response_body))
+            all_embeddings.append(response_body["embedding"])
+            total_tokens += response_body["inputTextTokenCount"]
 
         return self._create_response(
-            embeddings=[response_body["embedding"]],
+            embeddings=all_embeddings,
             model=embeddings_request.model,
-            input_tokens=response_body["inputTextTokenCount"],
+            input_tokens=total_tokens,
+            encoding_format=embeddings_request.encoding_format,
         )
 
 
