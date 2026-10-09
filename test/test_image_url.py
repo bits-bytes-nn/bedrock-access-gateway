@@ -1,7 +1,10 @@
 """Tests for the checks that keep caller-supplied image urls from reaching internal endpoints."""
 
 import base64
+import http.server
 import socket
+import threading
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -13,32 +16,22 @@ PUBLIC_IP = "93.184.216.34"
 
 
 class FakeResponse:
-    """Minimal stand-in for requests.Response as the fetch path uses it."""
+    """Minimal stand-in for urllib3.BaseHTTPResponse as the fetch path uses it."""
 
-    def __init__(self, status_code=200, headers=None, body=b"", history_location=None):
-        self.status_code = status_code
+    def __init__(self, status=200, headers=None, body=b"", location=None):
+        self.status = status
         self.headers = headers if headers is not None else {}
         self._body = body
-        if history_location:
-            self.headers["Location"] = history_location
+        self.released = False
+        if location:
+            self.headers["Location"] = location
 
-    @property
-    def is_redirect(self):
-        return self.status_code in (301, 302, 303, 307, 308)
-
-    @property
-    def is_permanent_redirect(self):
-        return self.status_code in (301, 308)
-
-    def iter_content(self, chunk_size):
+    def stream(self, chunk_size):
         for start in range(0, max(len(self._body), 1), chunk_size):
             yield self._body[start : start + chunk_size]
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        return False
+    def release_conn(self):
+        self.released = True
 
 
 @pytest.fixture
@@ -53,15 +46,15 @@ def resolve_to_public(monkeypatch):
 
 @pytest.fixture
 def capture_request(monkeypatch):
-    """Record the urls requests.get is called with and return canned responses."""
+    """Record the targets the gateway connects to and return canned responses."""
     calls = []
     responses = []
 
-    def fake_get(url, **kwargs):
-        calls.append((url, kwargs))
+    def fake_open(target, read_timeout):
+        calls.append(target)
         return responses.pop(0) if responses else FakeResponse(body=b"image-bytes")
 
-    monkeypatch.setattr(image_url_module.requests, "get", fake_get)
+    monkeypatch.setattr(image_url_module, "_open", fake_open)
     return calls, responses
 
 
@@ -69,10 +62,10 @@ def capture_request(monkeypatch):
 def forbid_request(monkeypatch):
     """Fail the test if an outbound request is attempted."""
 
-    def fail_get(*_args, **_kwargs):
+    def fail_open(*_args, **_kwargs):
         raise AssertionError("no outbound request expected")
 
-    monkeypatch.setattr(image_url_module.requests, "get", fail_get)
+    monkeypatch.setattr(image_url_module, "_open", fail_open)
 
 
 @pytest.mark.parametrize(
@@ -151,29 +144,27 @@ def test_fetches_a_public_url(resolve_to_public, capture_request):
     data, content_type = parse_image_url("https://example.com/cat.png")
 
     assert (data, content_type) == (b"png-bytes", "image/png")
-    assert calls[0][0] == "https://example.com/cat.png"
-    # Redirects must be handled by the module so each hop is re-validated.
-    assert calls[0][1]["allow_redirects"] is False
+    target = calls[0]
+    # The connection goes to the address that was checked, under the original host name.
+    assert (target.scheme, target.host, target.ips, target.port) == ("https", "example.com", (PUBLIC_IP,), 443)
+    assert (target.request_uri, target.host_header) == ("/cat.png", "example.com")
 
 
 def test_redirect_to_a_public_url_is_followed(resolve_to_public, capture_request):
     calls, responses = capture_request
-    responses.append(FakeResponse(status_code=302, history_location="https://cdn.example.com/cat.png"))
+    responses.append(FakeResponse(status=302, location="https://cdn.example.com/cat.png"))
     responses.append(FakeResponse(headers={"Content-Type": "image/webp"}, body=b"webp-bytes"))
 
     data, content_type = parse_image_url("https://example.com/cat.png")
 
     assert (data, content_type) == (b"webp-bytes", "image/webp")
-    assert [call[0] for call in calls] == [
-        "https://example.com/cat.png",
-        "https://cdn.example.com/cat.png",
-    ]
+    assert [call.host for call in calls] == ["example.com", "cdn.example.com"]
 
 
 def test_redirect_to_the_metadata_endpoint_is_blocked(monkeypatch, capture_request):
     """A public host must not be able to redirect the gateway to an internal address."""
     _calls, responses = capture_request
-    responses.append(FakeResponse(status_code=302, history_location="http://169.254.169.254/latest/meta-data/"))
+    responses.append(FakeResponse(status=302, location="http://169.254.169.254/latest/meta-data/"))
 
     def fake_getaddrinfo(host, port, **_kwargs):
         if host == "example.com":
@@ -190,11 +181,11 @@ def test_redirect_to_the_metadata_endpoint_is_blocked(monkeypatch, capture_reque
 def test_redirect_loop_is_bounded(resolve_to_public, monkeypatch):
     attempts = []
 
-    def fake_get(url, **_kwargs):
-        attempts.append(url)
-        return FakeResponse(status_code=302, history_location="https://example.com/next")
+    def fake_open(target, read_timeout):
+        attempts.append(target)
+        return FakeResponse(status=302, location="https://example.com/next")
 
-    monkeypatch.setattr(image_url_module.requests, "get", fake_get)
+    monkeypatch.setattr(image_url_module, "_open", fake_open)
 
     with pytest.raises(HTTPException) as exc_info:
         parse_image_url("https://example.com/cat.png")
@@ -247,7 +238,7 @@ def test_oversized_content_length_is_rejected_before_reading(resolve_to_public, 
 
 def test_non_200_response_is_rejected(resolve_to_public, capture_request):
     _calls, responses = capture_request
-    responses.append(FakeResponse(status_code=404))
+    responses.append(FakeResponse(status=404))
 
     with pytest.raises(HTTPException) as exc_info:
         parse_image_url("https://example.com/missing.png")
@@ -255,10 +246,10 @@ def test_non_200_response_is_rejected(resolve_to_public, capture_request):
 
 
 def test_connection_error_is_reported_as_a_client_error(resolve_to_public, monkeypatch):
-    def fake_get(*_args, **_kwargs):
-        raise image_url_module.requests.ConnectionError("refused")
+    def fake_open(*_args, **_kwargs):
+        raise image_url_module.urllib3.exceptions.NewConnectionError(None, "refused")
 
-    monkeypatch.setattr(image_url_module.requests, "get", fake_get)
+    monkeypatch.setattr(image_url_module, "_open", fake_open)
 
     with pytest.raises(HTTPException) as exc_info:
         parse_image_url("https://example.com/cat.png")
@@ -310,3 +301,166 @@ def test_invalid_data_url_payload_is_a_client_error(forbid_request):
     with pytest.raises(HTTPException) as exc_info:
         parse_image_url("data:image/png;base64,not!valid!base64")
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # urlparse sees example.com here, while urllib3 connects to the address before the backslash.
+        "http://169.254.169.254\\@example.com/../latest/meta-data/",
+        "http://10.0.0.5:8080\\@example.com/../admin",
+        "http://evil.test\\@images.example.com/x",
+        "http://example.com\\.169.254.169.254/",
+        "http://exa mple.com/",
+        "http://example.com/\ncat.png",
+    ],
+)
+def test_urls_that_parsers_disagree_on_are_rejected(url, resolve_to_public, forbid_request):
+    with pytest.raises(HTTPException) as exc_info:
+        parse_image_url(url)
+    assert exc_info.value.status_code == 400
+
+
+def test_credentials_in_url_are_rejected(resolve_to_public, forbid_request):
+    with pytest.raises(HTTPException) as exc_info:
+        parse_image_url("http://169.254.169.254@example.com/cat.png")
+    assert exc_info.value.status_code == 400
+
+
+def test_allowlist_is_checked_against_the_host_actually_contacted(resolve_to_public, capture_request, monkeypatch):
+    monkeypatch.setattr(image_url_module, "IMAGE_URL_ALLOWED_HOSTS", frozenset({"images.example.com"}))
+    calls, _responses = capture_request
+
+    parse_image_url("https://IMAGES.example.com:8443/cat.png")
+
+    assert (calls[0].host, calls[0].port, calls[0].host_header) == (
+        "images.example.com",
+        8443,
+        "images.example.com:8443",
+    )
+
+
+def test_connection_is_pinned_to_the_checked_address(monkeypatch, capture_request):
+    """DNS rebinding: a second lookup must not be able to swap in an internal address."""
+    answers = iter([PUBLIC_IP, "169.254.169.254"])
+
+    def rebinding_getaddrinfo(host, port, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (next(answers), port))]
+
+    monkeypatch.setattr(image_url_module.socket, "getaddrinfo", rebinding_getaddrinfo)
+    calls, _responses = capture_request
+
+    parse_image_url("https://rebind.example.com/cat.png")
+
+    assert [call.ips for call in calls] == [(PUBLIC_IP,)]
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "64:ff9b::a9fe:a9fe",  # NAT64 form of 169.254.169.254
+        "64:ff9b::a00:5",  # NAT64 form of 10.0.0.5
+        "2002:a9fe:a9fe::1",  # 6to4 form of 169.254.169.254
+        "::a9fe:a9fe",  # IPv4-compatible form of 169.254.169.254
+    ],
+)
+def test_ipv6_transition_forms_of_internal_addresses_are_blocked(address, monkeypatch, forbid_request):
+    def fake_getaddrinfo(host, port, **_kwargs):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port, 0, 0))]
+
+    monkeypatch.setattr(image_url_module.socket, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(HTTPException) as exc_info:
+        parse_image_url("https://v6.example.com/cat.png")
+    assert exc_info.value.status_code == 400
+
+
+def test_slow_download_is_cut_off_at_the_deadline(resolve_to_public, capture_request, monkeypatch):
+    _calls, responses = capture_request
+    responses.append(FakeResponse(headers={"Content-Type": "image/png"}, body=b"x" * (3 * 64 * 1024)))
+    clock = iter([0.0, 1.0, image_url_module.TOTAL_TIMEOUT_SECONDS + 1.0, 10_000.0])
+    monkeypatch.setattr(image_url_module.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(HTTPException) as exc_info:
+        parse_image_url("https://example.com/slow.png")
+    assert exc_info.value.status_code == 400
+
+
+def test_response_connection_is_released(resolve_to_public, capture_request):
+    _calls, responses = capture_request
+    response = FakeResponse(status=404)
+    responses.append(response)
+
+    with pytest.raises(HTTPException):
+        parse_image_url("https://example.com/missing.png")
+    assert response.released
+
+
+# --- real sockets on loopback, exercising _open and the deadline -------------------
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    seen_hosts: list = []
+    drip_delay = 0.0
+
+    def do_GET(self):
+        _Handler.seen_hosts.append(self.headers.get("Host"))
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.end_headers()
+        if _Handler.drip_delay:
+            for _ in range(100):
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(_Handler.drip_delay)
+        else:
+            self.wfile.write(b"png-bytes")
+
+    def log_message(self, *_args):
+        pass
+
+
+@pytest.fixture
+def loopback_server():
+    _Handler.seen_hosts = []
+    _Handler.drip_delay = 0.0
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+
+
+def _target(port, ips=("127.0.0.1",)):
+    return image_url_module._Target(
+        scheme="http", host="images.example.com", port=port, ips=ips, request_uri="/cat.png"
+    )
+
+
+def test_open_connects_to_the_pinned_address_with_the_original_host(loopback_server):
+    port = loopback_server.server_address[1]
+    response = image_url_module._open(_target(port), read_timeout=5)
+    assert response.read() == b"png-bytes"
+    response.release_conn()
+    assert _Handler.seen_hosts == [f"images.example.com:{port}"]
+
+
+def test_open_falls_back_to_the_next_address(loopback_server):
+    port = loopback_server.server_address[1]
+    # 127.0.0.2 refuses the connection on macOS and Linux CI alike, as nothing listens there on this port.
+    response = image_url_module._open(_target(port, ips=("127.0.0.2", "127.0.0.1")), read_timeout=2)
+    assert response.read() == b"png-bytes"
+    response.release_conn()
+
+
+def test_trickling_server_is_cut_off_by_the_deadline(loopback_server, monkeypatch):
+    """One byte at a time keeps every recv under the read timeout; the deadline must still apply."""
+    _Handler.drip_delay = 0.1
+    port = loopback_server.server_address[1]
+    monkeypatch.setattr(image_url_module, "TOTAL_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(image_url_module, "_validate_url", lambda url: _target(port))
+
+    started = time.monotonic()
+    with pytest.raises(HTTPException) as exc_info:
+        parse_image_url(f"http://images.example.com:{port}/cat.png")
+    assert exc_info.value.status_code == 400
+    assert time.monotonic() - started < 3

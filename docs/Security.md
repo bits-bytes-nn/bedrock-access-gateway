@@ -99,9 +99,12 @@ is made. A URL is only fetched when all of the following hold:
 | Check | Behaviour |
 |---|---|
 | Scheme | Only `http` and `https`. `file:`, `gopher:`, `ftp:`, `dict:` and others are rejected. |
-| Address | Every address the host resolves to must be globally routable. This blocks the link-local range that serves both metadata endpoints, as well as loopback, private, shared address space, reserved and multicast ranges, including their IPv4-mapped IPv6 forms. |
+| URL form | URLs containing credentials (`user@host`), backslashes, whitespace or control characters are rejected, because URL parsers disagree on which host such URLs name. |
+| Address | Every address the host resolves to must be globally routable. This blocks the link-local range that serves both metadata endpoints, as well as loopback, private, shared address space, reserved and multicast ranges, including their IPv4-mapped, IPv4-compatible, 6to4 and NAT64 IPv6 forms. |
+| Connection | Opened to the exact address that passed the check, with the original host name used for the `Host` header and TLS certificate verification. The host is not resolved again, so DNS rebinding cannot swap in an internal address. Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`) are not used. |
 | Redirects | Followed manually, up to 3 hops, and re-validated at every hop so a public URL cannot redirect to an internal one. |
 | Response size | Capped, so a large or endless response cannot exhaust task memory. |
+| Time | Each fetch, redirects included, must finish within 60 seconds, and a request may reference at most 20 remote image URLs, so a slow server cannot hold a worker. |
 | Content type | Normalised to a format Bedrock accepts (`image/jpeg`, `image/png`, `image/gif`, `image/webp`). |
 
 Rejected requests return `400` with a generic message, so error responses cannot be used to probe which
@@ -109,10 +112,8 @@ internal hosts exist.
 
 ### Recommended configuration
 
-The checks above resolve the host and then let the HTTP client resolve it again when connecting. A
-hostname served by an attacker-controlled DNS server with a very short TTL could in principle return a
-permitted address to the check and an internal address to the connection (DNS rebinding). To rule that
-out, and to reduce the blast radius generally, apply the controls that fit your deployment:
+Any authenticated caller can still make the gateway fetch an arbitrary public URL. To reduce that, apply
+the controls that fit your deployment:
 
 ```bash
 # Only allow images from hosts you trust. Strongest option; recommended if you know the hosts.

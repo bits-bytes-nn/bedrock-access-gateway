@@ -22,13 +22,14 @@ all of the following hold:
 Redirects are followed manually so that every hop is re-validated instead of
 letting a public URL redirect to an internal one.
 
-Note on residual risk: the checks above resolve the host and then let
-``requests`` resolve it again when connecting, so a hostname backed by an
-attacker-controlled DNS server with a very short TTL could in principle return a
-permitted address to the check and an internal one to the connection (DNS
-rebinding). Deployments that need to rule that out should set
-``IMAGE_URL_ALLOWED_HOSTS``, restrict the task's egress with security groups, or
-turn remote fetching off entirely with ``ENABLE_IMAGE_URL_FETCH=false``.
+The URL is parsed once, with the same parser that builds the outgoing request,
+and the connection is opened to the exact address that passed the checks (with
+the original host name kept for the ``Host`` header and TLS verification). This
+rules out two bypasses: a URL that two parsers read differently (for example
+``http://169.254.169.254\\@example.com/``), and DNS rebinding, where a host
+resolves to a public address for the check and an internal one for the
+connection. Each fetch also has an overall deadline so a slow server cannot hold
+a worker indefinitely.
 """
 
 import base64
@@ -37,10 +38,17 @@ import ipaddress
 import logging
 import re
 import socket
-from urllib.parse import urljoin, urlparse
+import threading
+import time
+from dataclasses import dataclass
+from urllib.parse import urljoin
 
-import requests
+import certifi
+import urllib3
 from fastapi import HTTPException
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.exceptions import ConnectTimeoutError, HTTPError, LocationParseError, NewConnectionError
+from urllib3.util import parse_url
 
 from api.setting import (
     ENABLE_IMAGE_URL_FETCH,
@@ -62,8 +70,16 @@ IMAGE_TYPE_ALIASES = {"image/jpg": "image/jpeg"}
 
 CONNECT_TIMEOUT_SECONDS = 5
 READ_TIMEOUT_SECONDS = 30
+# Upper bound for a whole fetch, redirects included.
+TOTAL_TIMEOUT_SECONDS = 60
 MAX_REDIRECTS = 3
 CHUNK_SIZE = 64 * 1024
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+# NAT64 (RFC 6052) embeds an IPv4 address in the last 32 bits.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+# Deprecated IPv4-compatible IPv6 addresses (::a.b.c.d).
+_IPV4_COMPATIBLE_PREFIX = ipaddress.ip_network("::/96")
 
 DATA_URL_PATTERN = r"^data:(image/[a-z]*);base64,\s*"
 
@@ -82,6 +98,33 @@ def normalize_image_content_type(content_type: str | None) -> str:
     return DEFAULT_IMAGE_TYPE
 
 
+@dataclass(frozen=True)
+class _Target:
+    """A validated fetch target, pinned to the address that passed the checks."""
+
+    scheme: str
+    host: str
+    port: int
+    # Every address the host resolved to, all of which passed the checks.
+    ips: tuple[str, ...]
+    request_uri: str
+
+    @property
+    def host_header(self) -> str:
+        return self.host if self.port == DEFAULT_PORTS[self.scheme] else f"{self.host}:{self.port}"
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address an IPv6 transition address forwards to, if any."""
+    if ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    if ip.sixtofour:
+        return ip.sixtofour
+    if ip in _NAT64_PREFIX or ip in _IPV4_COMPATIBLE_PREFIX:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
 def _resolved_addresses(host: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """Resolve a host to every address it maps to, IP literals included."""
     try:
@@ -90,49 +133,178 @@ def _resolved_addresses(host: str, port: int) -> list[ipaddress.IPv4Address | ip
         logger.warning("Unable to resolve image url host")
         raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
 
-    addresses = []
-    for addr_info in addr_infos:
-        ip = ipaddress.ip_address(addr_info[4][0])
-        # An IPv4-mapped IPv6 address such as ::ffff:169.254.169.254 reaches the
-        # same host as the IPv4 address it wraps, so check the wrapped address.
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
-        addresses.append(ip)
-    return addresses
+    return [ipaddress.ip_address(addr_info[4][0]) for addr_info in addr_infos]
 
 
-def _validate_url(url: str) -> None:
-    """Reject an image URL that the gateway must not fetch."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ALLOWED_SCHEMES:
+def _is_fetchable(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether an address is publicly routable, looking through IPv6 transition forms."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None:
+            # ::ffff:169.254.169.254, 2002:a9fe:a9fe::, 64:ff9b::a9fe:a9fe etc.
+            # reach the same host as the IPv4 address they wrap.
+            return embedded.is_global
+    return ip.is_global
+
+
+def _validate_url(url: str) -> _Target:
+    """Check an image URL and return the pinned target the gateway may fetch."""
+    # Backslashes, whitespace and control characters are read differently by
+    # different URL parsers, so they are never needed in a legitimate image URL.
+    if "\\" in url or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise HTTPException(status_code=400, detail="Image url contains invalid characters")
+
+    try:
+        parsed = parse_url(url)
+    except LocationParseError:
+        raise HTTPException(status_code=400, detail="Image url is not valid")
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ALLOWED_SCHEMES:
         raise HTTPException(
             status_code=400,
             detail="Image url must be an http(s) url or a base64 data url",
         )
+    if parsed.auth:
+        raise HTTPException(status_code=400, detail="Image url must not contain credentials")
 
-    host = parsed.hostname
+    host = (parsed.host or "").lower()
     if not host:
         raise HTTPException(status_code=400, detail="Image url is missing a host")
 
-    if IMAGE_URL_ALLOWED_HOSTS and host.lower() not in IMAGE_URL_ALLOWED_HOSTS:
+    if IMAGE_URL_ALLOWED_HOSTS and host.strip("[]") not in IMAGE_URL_ALLOWED_HOSTS:
         raise HTTPException(
             status_code=400,
             detail=f"Image url host is not allowed: {host}",
         )
 
-    try:
-        port = parsed.port or DEFAULT_PORTS[parsed.scheme]
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Image url has an invalid port")
-
-    for ip in _resolved_addresses(host, port):
-        if not ip.is_global:
+    port = parsed.port or DEFAULT_PORTS[scheme]
+    addresses = _resolved_addresses(host.strip("[]"), port)
+    for ip in addresses:
+        if not _is_fetchable(ip):
             logger.warning("Blocked image url resolving to non-routable address %s", ip)
             raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
 
+    return _Target(
+        scheme=scheme,
+        host=host,
+        port=port,
+        ips=tuple(dict.fromkeys(str(ip) for ip in addresses)),
+        request_uri=parsed.request_uri,
+    )
 
-def _read_capped(response: requests.Response, max_bytes: int) -> bytes:
-    """Read a response body, refusing anything larger than ``max_bytes``."""
+
+class _Deadline:
+    """Shut down the sockets of a fetch once its overall time budget is spent.
+
+    Socket timeouts only bound a single read, so a server that sends a byte just
+    before each timeout could otherwise hold a worker thread indefinitely.
+    """
+
+    def __init__(self, seconds: float):
+        self._sockets: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self.expired = False
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+
+    def __enter__(self) -> "_Deadline":
+        _current.deadline = self
+        self._timer.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._timer.cancel()
+        _current.deadline = None
+
+    def register(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._sockets.append(sock)
+            if self.expired:
+                self._shutdown(sock)
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            for sock in self._sockets:
+                self._shutdown(sock)
+
+    @staticmethod
+    def _shutdown(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+# The deadline of the fetch running on this thread; connections register with it.
+_current = threading.local()
+
+
+class _DeadlineConnectionMixin:
+    def _new_conn(self) -> socket.socket:
+        sock = super()._new_conn()
+        deadline = getattr(_current, "deadline", None)
+        if deadline is not None:
+            deadline.register(sock)
+        return sock
+
+
+class _HTTPConnection(_DeadlineConnectionMixin, HTTPConnection):
+    pass
+
+
+class _HTTPSConnection(_DeadlineConnectionMixin, HTTPSConnection):
+    pass
+
+
+class _HTTPConnectionPool(urllib3.HTTPConnectionPool):
+    ConnectionCls = _HTTPConnection
+
+
+class _HTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    ConnectionCls = _HTTPSConnection
+
+
+def _open(target: _Target, read_timeout: float) -> urllib3.BaseHTTPResponse:
+    """Send the request to a validated address without re-resolving the host.
+
+    Addresses are tried in resolution order, like a normal client would, so an
+    unreachable IPv6 address does not prevent falling back to IPv4.
+    """
+    timeout = urllib3.Timeout(connect=min(CONNECT_TIMEOUT_SECONDS, read_timeout), read=read_timeout)
+    hostname = target.host.strip("[]")
+    for attempt, ip in enumerate(target.ips, start=1):
+        if target.scheme == "https":
+            pool = _HTTPSConnectionPool(
+                ip,
+                target.port,
+                timeout=timeout,
+                retries=False,
+                cert_reqs="CERT_REQUIRED",
+                ca_certs=certifi.where(),
+                # Verify the certificate and send SNI for the requested host, not the IP.
+                server_hostname=hostname,
+                assert_hostname=hostname,
+            )
+        else:
+            pool = _HTTPConnectionPool(ip, target.port, timeout=timeout, retries=False)
+        try:
+            return pool.urlopen(
+                "GET",
+                target.request_uri,
+                headers={"Host": target.host_header, "Accept": "image/*"},
+                redirect=False,
+                preload_content=False,
+            )
+        except (NewConnectionError, ConnectTimeoutError):
+            if attempt == len(target.ips):
+                raise
+    raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+
+
+def _read_capped(response: urllib3.BaseHTTPResponse, max_bytes: int, deadline: float) -> bytes:
+    """Read a response body, refusing anything larger than ``max_bytes`` or slower than the deadline."""
     declared_length = response.headers.get("Content-Length")
     if declared_length and declared_length.isdigit() and int(declared_length) > max_bytes:
         raise HTTPException(
@@ -141,13 +313,20 @@ def _read_capped(response: requests.Response, max_bytes: int) -> bytes:
         )
 
     content = bytearray()
-    for chunk in response.iter_content(CHUNK_SIZE):
+    for chunk in response.stream(CHUNK_SIZE):
         content += chunk
         if len(content) > max_bytes:
             raise HTTPException(
                 status_code=413,
                 detail=f"Image exceeds the maximum size of {IMAGE_URL_MAX_SIZE_MB} MB",
             )
+        if time.monotonic() > deadline:
+            break
+    # Checked after the loop as well: when the deadline shuts the socket down, a body
+    # without Content-Length simply ends early and must not be returned as complete.
+    if time.monotonic() > deadline:
+        logger.warning("Image url download exceeded %s seconds", TOTAL_TIMEOUT_SECONDS)
+        raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
     return bytes(content)
 
 
@@ -180,33 +359,39 @@ def _fetch_image(image_url: str) -> tuple[bytes, str]:
         )
 
     max_bytes = IMAGE_URL_MAX_SIZE_MB * 1024 * 1024
-    url = image_url
-    for _ in range(MAX_REDIRECTS + 1):
-        _validate_url(url)
-        try:
-            response = requests.get(
-                url,
-                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
-                # Followed manually below so that every hop is re-validated.
-                allow_redirects=False,
-                stream=True,
-            )
-        except requests.RequestException:
-            logger.warning("Image url request failed", exc_info=True)
-            raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
-
-        with response:
-            if response.is_redirect or response.is_permanent_redirect:
-                location = response.headers.get("Location")
-                if not location:
-                    raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
-                url = urljoin(url, location)
-                continue
-
-            if response.status_code != 200:
+    deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    with _Deadline(TOTAL_TIMEOUT_SECONDS):
+        url = image_url
+        for _ in range(MAX_REDIRECTS + 1):
+            target = _validate_url(url)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+            try:
+                response = _open(target, read_timeout=min(READ_TIMEOUT_SECONDS, remaining))
+            except (HTTPError, OSError):
+                logger.warning("Image url request failed", exc_info=True)
                 raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
 
-            content_type = normalize_image_content_type(response.headers.get("Content-Type"))
-            return _read_capped(response, max_bytes), content_type
+            try:
+                if response.status in REDIRECT_STATUSES:
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+                    # Followed here, not by the client, so that every hop is re-validated.
+                    url = urljoin(url, location)
+                    continue
 
-    raise HTTPException(status_code=400, detail="Image url has too many redirects")
+                if response.status != 200:
+                    raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+
+                content_type = normalize_image_content_type(response.headers.get("Content-Type"))
+                try:
+                    return _read_capped(response, max_bytes, deadline), content_type
+                except (HTTPError, OSError):
+                    logger.warning("Image url download failed", exc_info=True)
+                    raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+            finally:
+                response.release_conn()
+
+        raise HTTPException(status_code=400, detail="Image url has too many redirects")
