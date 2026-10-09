@@ -99,11 +99,36 @@ TEMPERATURE_TOPP_CONFLICT_MODELS = {
     "claude-opus-4-5",
 }
 
+# Models that reject temperature and topP outright ("`temperature` is deprecated for this model")
+# Both parameters are dropped from the request for these models
+NO_SAMPLING_PARAMS_MODELS = {
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
+    "claude-fable-5",
+}
+
+# Models that only accept adaptive thinking ("thinking.type.enabled" is rejected)
+# reasoning_effort is mapped to output_config.effort instead of a budget_tokens value
+ADAPTIVE_THINKING_MODELS = NO_SAMPLING_PARAMS_MODELS
+
+# Bedrock rejects Claude thinking budgets below this value
+MIN_THINKING_BUDGET_TOKENS = 1024
+
 # Models that don't support assistant message prefill
 # For these models, if conversation ends with assistant message (e.g., "continue response"),
 # a user message will be added to ask the model to continue
 NO_ASSISTANT_PREFILL_MODELS = {
     "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
+    "claude-fable-5",
 }
 
 
@@ -803,6 +828,10 @@ class BedrockModel(BaseChatModel):
                 if DEBUG:
                     logger.info(f"Removed topP for {chat_request.model} (conflicts with temperature)")
 
+        if any(model in model_lower for model in NO_SAMPLING_PARAMS_MODELS):
+            inference_config.pop("temperature", None)
+            inference_config.pop("topP", None)
+
         if chat_request.stop is not None:
             stop = chat_request.stop
             if isinstance(stop, str):
@@ -822,7 +851,15 @@ class BedrockModel(BaseChatModel):
             resolved_model = self._resolve_to_foundation_model(chat_request.model)
             model_lower = resolved_model.lower()
 
-            if "anthropic.claude" in model_lower:
+            if "anthropic.claude" in model_lower and any(
+                model in model_lower for model in ADAPTIVE_THINKING_MODELS
+            ):
+                # Newer Claude models: adaptive thinking, depth controlled by effort
+                args["additionalModelRequestFields"] = {
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": chat_request.reasoning_effort},
+                }
+            elif "anthropic.claude" in model_lower:
                 # Claude format: reasoning_config = object with budget_tokens
                 if effective_max_tokens is None:
                     raise HTTPException(
@@ -832,9 +869,16 @@ class BedrockModel(BaseChatModel):
                 # unset topP - Not supported
                 inference_config.pop("topP", None)
 
-                budget_tokens = self._calc_budget_tokens(
-                    effective_max_tokens, chat_request.reasoning_effort
+                budget_tokens = max(
+                    MIN_THINKING_BUDGET_TOKENS,
+                    self._calc_budget_tokens(effective_max_tokens, chat_request.reasoning_effort),
                 )
+                if budget_tokens >= effective_max_tokens:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"max_tokens must be greater than {MIN_THINKING_BUDGET_TOKENS} "
+                        "when using reasoning_effort with this model",
+                    )
                 args["additionalModelRequestFields"] = {
                     "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
                 }
@@ -901,7 +945,8 @@ class BedrockModel(BaseChatModel):
         reasoning_text = ""
         for block in content:
             if "reasoningContent" in block:
-                reasoning_text += block["reasoningContent"]["reasoningText"].get("text", "")
+                # Some models (e.g. OpenAI GPT) return only encrypted redactedContent
+                reasoning_text += block["reasoningContent"].get("reasoningText", {}).get("text", "")
 
         if reasoning_text:
             # Use tiktoken to estimate token count
@@ -945,9 +990,10 @@ class BedrockModel(BaseChatModel):
             message.content = ""
             for c in content:
                 if "reasoningContent" in c:
-                    message.reasoning_content = c["reasoningContent"][
-                        "reasoningText"
-                    ].get("text", "")
+                    # redactedContent is encrypted and has no text to surface
+                    message.reasoning_content = c["reasoningContent"].get(
+                        "reasoningText", {}
+                    ).get("text", "")
                 elif "text" in c:
                     message.content = c["text"]
                 else:
@@ -1066,6 +1112,8 @@ class BedrockModel(BaseChatModel):
                         self.think_emitted = False
                     else:
                         return None  # Ignore signature if no <think> started
+                else:
+                    return None  # e.g. encrypted redactedContent, nothing to surface
             else:
                 # tool use
                 index = chunk["contentBlockDelta"]["contentBlockIndex"] - 1
