@@ -6,10 +6,10 @@ Parameters:
     Description: The secret ARN in Secrets Manager used to store the API Key
   ContainerImageUri:
     Type: String
-    Description: The ECR image URI for the Lambda function (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/bedrock-proxy-api:latest)
+    Description: The ECR image URI for the Lambda function. Use a digest (repo@sha256:...) or a unique tag; an unchanged URI does not redeploy the function.
   DefaultModelId:
     Type: String
-    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Default: global.anthropic.claude-opus-5-5
     Description: The default model ID, please make sure the model ID is supported in the current region
   DefaultEmbeddingModelId:
     Type: String
@@ -20,6 +20,17 @@ Parameters:
     Default: 90
     AllowedValues: [7, 14, 30, 60, 90, 180, 365, 731]
     Description: How long CloudWatch keeps the Lambda function logs
+  EnableImageUrlFetch:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Allow image_url content parts that point at remote http(s) URLs. When false, only base64 data URLs are accepted.
+  ImageUrlAllowedHosts:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated list of hosts remote image URLs may point at. Empty allows any publicly routable host.
   EnablePromptCaching:
     Type: String
     Default: "false"
@@ -57,12 +68,11 @@ Resources:
               - bedrock:InvokeModelWithResponseStream
             Effect: Allow
             Resource:
-              - arn:aws:bedrock:*::foundation-model/*
-              - arn:aws:bedrock:*:*:inference-profile/*
-              - arn:aws:bedrock:*:*:application-inference-profile/*
+              - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:*:*:application-inference-profile/*"
           - Action:
               - secretsmanager:GetSecretValue
-              - secretsmanager:DescribeSecret
             Effect: Allow
             Resource: !Ref ApiKeySecretArn
         Version: "2012-10-17"
@@ -100,6 +110,8 @@ Resources:
           ENABLE_CROSS_REGION_INFERENCE: "true"
           ENABLE_APPLICATION_INFERENCE_PROFILES: "true"
           ENABLE_PROMPT_CACHING: !Ref EnablePromptCaching
+          ENABLE_IMAGE_URL_FETCH: !Ref EnableImageUrlFetch
+          IMAGE_URL_ALLOWED_HOSTS: !Ref ImageUrlAllowedHosts
           API_ROUTE_PREFIX: /v1
       LoggingConfig:
         LogFormat: Text
