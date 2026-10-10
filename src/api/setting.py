@@ -39,7 +39,7 @@ Use OpenAI-Compatible RESTful APIs for Amazon Bedrock models.
 DEBUG = _env_flag("DEBUG", False)
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "anthropic.claude-3-sonnet-20240229-v1:0")
-DEFAULT_EMBEDDING_MODEL = os.environ.get("DEFAULT_EMBEDDING_MODEL", "cohere.embed-multilingual-v3")
+DEFAULT_EMBEDDING_MODEL = os.environ.get("DEFAULT_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
 ENABLE_CROSS_REGION_INFERENCE = _env_flag("ENABLE_CROSS_REGION_INFERENCE", True)
 ENABLE_APPLICATION_INFERENCE_PROFILES = _env_flag("ENABLE_APPLICATION_INFERENCE_PROFILES", True)
 ENABLE_PROMPT_CACHING = _env_flag("ENABLE_PROMPT_CACHING", False)

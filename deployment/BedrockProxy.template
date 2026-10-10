@@ -11,6 +11,15 @@ Parameters:
     Type: String
     Default: anthropic.claude-3-sonnet-20240229-v1:0
     Description: The default model ID, please make sure the model ID is supported in the current region
+  DefaultEmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: The embedding model used for OpenAI embedding model names (text-embedding-*), please make sure it is supported in the current region
+  LogRetentionInDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365, 731]
+    Description: How long CloudWatch keeps the Lambda function logs
   EnablePromptCaching:
     Type: String
     Default: "false"
@@ -61,6 +70,12 @@ Resources:
       Roles:
         - !Ref ProxyApiHandlerServiceRole
 
+  ProxyApiHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-proxy-api"
+      RetentionInDays: !Ref LogRetentionInDays
+
   # Lambda Function with Lambda Web Adapter for streaming
   ProxyApiHandler:
     Type: AWS::Lambda::Function
@@ -81,11 +96,14 @@ Resources:
           DEBUG: "false"
           API_KEY_SECRET_ARN: !Ref ApiKeySecretArn
           DEFAULT_MODEL: !Ref DefaultModelId
-          DEFAULT_EMBEDDING_MODEL: cohere.embed-multilingual-v3
+          DEFAULT_EMBEDDING_MODEL: !Ref DefaultEmbeddingModelId
           ENABLE_CROSS_REGION_INFERENCE: "true"
           ENABLE_APPLICATION_INFERENCE_PROFILES: "true"
           ENABLE_PROMPT_CACHING: !Ref EnablePromptCaching
           API_ROUTE_PREFIX: /v1
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref ProxyApiHandlerLogGroup
       MemorySize: 1024
       PackageType: Image
       Role: !GetAtt ProxyApiHandlerServiceRole.Arn
