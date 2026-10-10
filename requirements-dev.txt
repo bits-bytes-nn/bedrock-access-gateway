@@ -1,4 +1,4 @@
-# Test and lint dependencies; the runtime dependencies are pinned in src/requirements.txt.
+# Test and lint dependencies; the runtime dependencies are locked in src/requirements.txt.
 -r src/requirements.txt
 pytest==9.1.1
 pytest-cov==7.1.0
@@ -7,3 +7,5 @@ httpx2==2.13.1
 # Response models from the OpenAI SDK are used as contract checks in the tests.
 openai==3.28.0
 ruff==0.17.0
+# Lints deployment/BedrockProxy.template.
+cfn-lint==1.57.2

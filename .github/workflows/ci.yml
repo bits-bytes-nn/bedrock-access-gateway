@@ -25,3 +25,14 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest --cov=src/api --cov-report=term-missing
+      - run: cfn-lint deployment/BedrockProxy.template
+      # shellcheck is preinstalled on the GitHub-hosted Ubuntu runners.
+      - run: shellcheck scripts/*.sh
+
+  # Builds the deployed Lambda image (arm64) without pushing it, so a broken base image,
+  # adapter tag or dependency install fails here rather than at deploy time.
+  image:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --file src/Dockerfile src/
