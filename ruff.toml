@@ -5,16 +5,20 @@ target-version = "py312"
 exclude = [
     ".venv",
     ".vscode",
-    "test/*"
 ]
 
 [lint]
-select = ["E", "F", "I"]
+# B catches bug-prone patterns such as raising without "from" inside "except".
+select = ["E", "F", "I", "B"]
 ignore = [
     "E501",
     "C901",
-    "F401",
+    # Optional hook methods on the abstract base classes are intentionally empty.
+    "B027",
 ]
+
+[lint.isort]
+known-first-party = ["api"]
 
 [format]
 # use double quotes for strings.

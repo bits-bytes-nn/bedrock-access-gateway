@@ -7,11 +7,12 @@ RUN dnf upgrade -y && dnf clean all
 # Add Lambda Web Adapter for API Gateway response streaming
 COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt/extensions/lambda-adapter
 
-COPY ./api ./api
-
+# Dependencies first, so code changes reuse the cached dependency layer.
 COPY requirements.txt .
 
-RUN pip3 install -r requirements.txt -U --no-cache-dir
+RUN pip3 install -r requirements.txt --no-cache-dir
+
+COPY ./api ./api
 
 # Preload tiktoken encoding: https://github.com/aws-samples/bedrock-access-gateway/issues/118
 ENV TIKTOKEN_CACHE_DIR=/var/task/.cache/tiktoken

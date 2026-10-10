@@ -161,3 +161,10 @@ cython_debug/
 
 Config
 .vscode/launch.json
+
+# Local environment and editor files
+.env.*
+.envrc
+.DS_Store
+.vscode/
+.claude/settings.local.json

@@ -1,0 +1,11 @@
+# Tool configuration only; the application is packaged from src/ by the Dockerfiles.
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["src"]
+addopts = "-q"
+filterwarnings = [
+    "error::DeprecationWarning:api.*",
+    # Raised inside starlette.testclient itself, not by this code.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
