@@ -14,6 +14,7 @@ export OPENAI_BASE_URL=<API base url>
 - [Embedding API](#embedding-api)
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
+- [Structured output](#structured-output)
 - [Reasoning](#reasoning)
 - [Interleaved thinking (beta)](#interleaved-thinking-beta)
 
@@ -374,6 +375,46 @@ You can try it with different questions, such as:
 1. Hello, who are you?  (No tools are needed)
 2. What is the weather like today?  (Should use get_current_location tool first)
 
+
+## Structured output
+
+`response_format` with `type: "json_schema"` is translated to the Converse
+[structured outputs](https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html) setting, so
+Bedrock constrains the answer to the schema. It works with the models that support structured outputs (checked: Claude
+Haiku 4.5, Sonnet 5.5 and Opus 5.5, and OpenAI GPT-6); other models (for example Amazon Nova and Claude 3.5) return
+`400 This model doesn't support the outputConfig field`.
+
+Bedrock supports a subset of JSON Schema: objects need `"additionalProperties": false`, and numeric and string
+length constraints are not supported. A new schema is compiled on first use, which can take a while; it is cached
+for 24 hours. `strict` is accepted and has no effect, because the schema is always enforced.
+
+```python
+from openai import OpenAI
+from pydantic import BaseModel
+
+client = OpenAI()
+
+
+class City(BaseModel):
+    name: str
+    population: int
+
+
+completion = client.chat.completions.parse(
+    model="global.anthropic.claude-opus-5-5",
+    messages=[{"role": "user", "content": "What is the largest city in Korea?"}],
+    response_format=City,
+)
+print(completion.choices[0].message.parsed)
+```
+
+`type: "json_object"` cannot be enforced by Converse, which needs a schema. The gateway adds an instruction to
+answer with a single JSON object to the system prompt, so the output is usually, but not always, valid JSON. Use
+`json_schema` when the output must parse.
+
+With either JSON format, reasoning is not added to the message content as a `<think>` block, so the content stays
+parseable; reasoning tokens are still reported in `usage`. Strict tool definitions (`strict` on a function) are not
+passed to Bedrock, because several models reject the field.
 
 ## Reasoning
 

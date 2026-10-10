@@ -5,6 +5,11 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 ## Unreleased
 
 ### Added
+- `response_format` `json_schema` is sent to Bedrock as structured outputs (`outputConfig.textFormat`);
+  `json_object` adds a JSON instruction to the system prompt. JSON responses carry no `<think>` block.
+- Fargate template: optional HTTPS listener (`CertificateArn`) with HTTP redirected to HTTPS, container logs in
+  `/ecs/<stack name>-proxy-api`, a deployment circuit breaker, and the `DefaultEmbeddingModelId`,
+  `LogRetentionInDays`, `EnableImageUrlFetch` and `ImageUrlAllowedHosts` parameters.
 - API Gateway stage throttling, set by the `ThrottlingRateLimit` (default 10 requests per second) and
   `ThrottlingBurstLimit` (default 20) stack parameters, to bound the spend if the API key leaks.
 - `IMAGE_URI` for `scripts/deploy-lambda.sh` redeploys a pushed image by digest, for rollbacks.
@@ -27,6 +32,9 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 - `GET /models/{id}` uses the cached model list, refreshing it (at most once a minute) only for unknown ids.
 - CORS no longer allows credentials; the API key is sent in the `Authorization` header.
 - `ApiKeySecretArn` must be the full secret ARN, which the IAM policy needs to match.
+- Fargate template: default model `global.anthropic.claude-opus-5-5` and embedding model
+  `amazon.titan-embed-text-v2:0` (previously the retired Claude 3 Sonnet and a fixed Cohere v3), no
+  `secretsmanager:DescribeSecret`, log permissions scoped to the log group, and partition-aware ARNs.
 - Prompt caching is only applied to models that support it (Claude 3.7 Sonnet, Claude 3.5 Haiku and later,
   Nova). Claude 3 Haiku and 3.5 Sonnet previously failed every request while caching was enabled.
 - Claude Opus 4.6 no longer receives `temperature` and `top_p` together.

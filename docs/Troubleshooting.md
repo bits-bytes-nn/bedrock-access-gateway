@@ -12,6 +12,8 @@ older `/aws/lambda/<stack name>-ProxyApiHandler-<id>` group.
 aws logs tail /aws/lambda/<stack name>-proxy-api --since 1h --follow
 ```
 
+The Fargate tasks log to `/ecs/<stack name>-proxy-api`, also with the `LogRetentionInDays` retention.
+
 ## Error format
 
 Errors are returned as JSON with a `detail` field and an HTTP status:

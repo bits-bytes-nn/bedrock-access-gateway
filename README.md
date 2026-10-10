@@ -131,16 +131,16 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
    - **Stack name**: Enter a stack name (e.g., "BedrockProxyAPI")
    - **ApiKeySecretArn**: Enter the full secret ARN from Step 1, including its 6-character suffix
    - **ContainerImageUri**: Enter the ECR image URI from Step 2 output
-   - **DefaultModelId**: (Optional) Model used for OpenAI model names such as `gpt-4o` (default `global.anthropic.claude-opus-5-5`
-     for the Lambda template; the Fargate template has an older default, set it explicitly)
-
-   The remaining parameters exist in the Lambda template only:
+   - **DefaultModelId**: (Optional) Model used for OpenAI model names such as `gpt-4o` (default `global.anthropic.claude-opus-5-5`)
    - **DefaultEmbeddingModelId**: (Optional) Model used for OpenAI embedding model names such as `text-embedding-3-small` (default `amazon.titan-embed-text-v2:0`)
    - **EnablePromptCaching**: (Optional) Add cache points for models that support prompt caching
    - **EnableImageUrlFetch**, **ImageUrlAllowedHosts**: (Optional) Controls for remote image URLs, see the [Security Guide](./docs/Security.md)
-   - **LogRetentionInDays**: (Optional) How long the function logs are kept (default 90)
-   - **ThrottlingRateLimit**, **ThrottlingBurstLimit**: (Optional) Requests per second and burst the API accepts
-     (default 10 and 20), which caps the Bedrock spend if the API key leaks
+   - **LogRetentionInDays**: (Optional) How long the logs are kept (default 90)
+   - **ThrottlingRateLimit**, **ThrottlingBurstLimit** (Lambda template only): (Optional) Requests per second and
+     burst the API accepts (default 10 and 20), which caps the Bedrock spend if the API key leaks
+   - **CertificateArn** (Fargate template only): ACM certificate for an HTTPS listener, with HTTP redirected to
+     HTTPS. Without it the ALB serves plain HTTP and the API key travels unencrypted; see the
+     [Security Guide](./docs/Security.md#1-https-on-the-alb)
 
    Click "Next".
 
@@ -148,7 +148,8 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 
 7. On the "Review" page, review all details. Check the "I acknowledge that AWS CloudFormation might create IAM resources" checkbox at the bottom. Click "Submit".
 
-That is it! Once deployed, click the CloudFormation stack and go to **Outputs** tab, you can find the API Base URL from `APIBaseUrl`. For API Gateway + Lambda it looks like `https://xxxx.execute-api.<region>.amazonaws.com/api/v1`; for ALB + Fargate, `http://xxxx.xxx.elb.amazonaws.com/api/v1`.
+That is it! Once deployed, click the CloudFormation stack and go to **Outputs** tab, you can find the API Base URL from `APIBaseUrl`. For API Gateway + Lambda it looks like `https://xxxx.execute-api.<region>.amazonaws.com/api/v1`; for ALB + Fargate, `https://<your domain>/api/v1` with a certificate (point the domain at the `ALBDnsName` output)
+or `http://xxxx.xxx.elb.amazonaws.com/api/v1` without one.
 
 ### Troubleshooting
 
@@ -422,7 +423,9 @@ If you set the matching environment variables on the function by hand (for examp
 check them with `aws lambda get-function-configuration` first and pass them through `PARAMETERS`, because a
 stack update replaces the function's whole environment.
 
-For the Fargate stack, push new images with `scripts/push-to-ecr.sh` and update the stack.
+For the Fargate stack, push a new image with a unique tag using `scripts/push-to-ecr.sh`, then update the stack
+with the new `ContainerImageUri`. A deployment whose tasks fail to start is rolled back automatically. The
+Fargate stack has no request throttling; restrict who can reach the ALB if the key could leak.
 
 ## Configuration
 
@@ -454,7 +457,7 @@ Boolean settings accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); a
 pip install -r requirements-dev.txt   # or: uv pip install -r requirements-dev.txt
 ruff check . && ruff format --check .
 pytest
-cfn-lint deployment/BedrockProxy.template
+cfn-lint deployment/*.template
 shellcheck scripts/*.sh
 ```
 
