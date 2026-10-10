@@ -2,80 +2,88 @@
 
 This guide helps you troubleshoot common issues you might encounter when using the Bedrock Access Gateway.
 
-## Common Issues
+## Where to find logs
 
-### 1. Parameter Store Access Error
+The Lambda function logs to the CloudWatch log group `/aws/lambda/<stack name>-proxy-api`, which the stack
+creates with the `LogRetentionInDays` retention. Stacks deployed before that log group existed also have an
+older `/aws/lambda/<stack name>-ProxyApiHandler-<id>` group.
 
-To see errors, first you need to access the CloudWatch Logs of the Lambda/Fargate instance.
-
-1. Go to the [CloudWatch Console](https://console.aws.amazon.com/cloudwatch/home?#logsV2:log-groups/)
-2. Search for `/aws/lambda/BedrockProxyAPI`
-3. Click on the `Log Stream` to see the error details
-
-```python
-botocore.exceptions.ClientError: An error occurred (ParameterNotFound) when calling the GetParameter operation: Parameter /BedrockProxyAPIKey not found.
+```bash
+aws logs tail /aws/lambda/<stack name>-proxy-api --since 1h --follow
 ```
 
-This error occurs when the Lambda function cannot access the API key parameter in Parameter Store.
+## Error format
 
-**Possible solutions:**
-- Verify that you created the parameter in Parameter Store with the correct name
-- Check that the parameter name in the CloudFormation stack matches the one in Parameter Store
-- Ensure the Lambda function's IAM role has permission to access Parameter Store
-- If you didn't set up an API key, leave the `ApiKeyParam` field blank during deployment
+Errors are returned as JSON with a `detail` field and an HTTP status:
 
-### 2. Model Access Issues
-
-If you receive an error about model access:
-
-```
-{"error": {"message": "User: arn:aws:iam::XXXX:role/XXX is not authorized to perform: bedrock:InvokeModel on resource: arn:aws:bedrock:REGION::foundation-model/XXX", "type": "auth_error", "code": 401}}
+```json
+{"detail": "Unsupported model nope, please use models API to get a list of supported models"}
 ```
 
-**Possible solutions:**
-- Ensure you have requested access to the model in Amazon Bedrock
-- Verify the Lambda/Fargate role has the necessary permissions to invoke Bedrock models
-- Check that you're using the correct model ID
-- Verify the model is available in your chosen region
-
-### 3. API Key Authentication Failures
-
-If you receive a 401 Unauthorized error:
+Once a streaming response has started, an error can only be sent as an event inside the stream:
 
 ```
-{"detail": "Could not validate credentials"}
+data: {"error": {"message": "..."}}
 ```
 
-**Possible solutions:**
-- Verify you're using the correct API key in your requests
-- Check that the `Authorization` header is properly formatted (`Bearer YOUR-API-KEY`)
-- If using environment variables, ensure `OPENAI_API_KEY` is set correctly
+Request errors (unknown model, invalid parameters) are detected before the stream starts and return a normal
+HTTP status.
 
-### 4. Cross-Region Access Issues
+| Status | Cause |
+|---|---|
+| `400` | Invalid request, unsupported model or parameter, or a Bedrock `ValidationException` (its message is included) |
+| `401` / `403` | Missing or wrong API key (`Invalid API Key`, `Not authenticated`) |
+| `403` | Bedrock denied access to the model. The message is generic; the full error, including the role, is in the logs |
+| `404` | Unknown model id in `GET /models/{id}`, or a Bedrock `ResourceNotFoundException` |
+| `413` | A remote image is larger than `IMAGE_URL_MAX_SIZE_MB` |
+| `429` | Bedrock throttling or quota exceeded |
+| `502` / `503` / `504` | Bedrock model error, model or service unavailable, or model timeout |
+| `500` | Unexpected error; see the logs |
 
-If you're trying to access models in a different region:
+## Common issues
 
-```
-{"error": {"message": "Region 'us-east-1' is not enabled for your account", "type": "invalid_request_error", "code": 400}}
-```
+### The function fails to start
 
-**Possible solutions:**
-- Ensure the target region is enabled for your AWS account
-- Verify the model you're trying to access is available in that region
-- Check that your IAM roles have the necessary cross-region permissions
+The application reads the API key when it starts and stops if it cannot:
 
-### 5. Rate Limiting and Quotas
+- `API Key is not configured`: none of `API_KEY_SECRET_ARN`, `API_KEY_PARAM_NAME` or `API_KEY` is set.
+- `Unable to retrieve API KEY`: the secret ARN is wrong, or the function role cannot read it.
+- `Please ensure the secret is a JSON string with an "api_key" field`: store the secret as key/value with the
+  key `api_key`.
+- `... must be true or false` or `... must be a positive integer`: a setting has an invalid value, see
+  [Configuration](../README.md#configuration).
 
-If you're experiencing throttling or quota issues:
+### Unsupported model
 
-```
-{"error": {"message": "Rate limit exceeded", "type": "rate_limit_error", "code": 429}}
-```
+The model must be listed by `GET /models`, which shows the foundation models and inference profiles available
+in the Region. A model enabled after the function started is picked up automatically on the first request that
+names it. Many current models are only available through an inference profile; use the profile id
+(`global.anthropic.claude-opus-5-5`, `global.cohere.embed-v4:0`) rather than the foundation model id.
 
-**Possible solutions:**
-- Check your Bedrock service quotas in the AWS Console
-- Consider implementing retry logic in your application
-- Request a quota increase if needed
+### Access denied (403)
+
+- Make sure model access is enabled for the model in the Amazon Bedrock console.
+- Some models need an extra opt-in. For example, Claude Fable requires a data retention setting and returns
+  `data retention mode 'default' is not available for this model` until it is configured.
+
+### Parameter errors from newer models
+
+Newer models reject some OpenAI parameters. The gateway adjusts requests for the models it knows (see
+[`src/api/models/model_rules.py`](../src/api/models/model_rules.py)): for example it drops `temperature` and
+`top_p` for Claude 5 models. If a model returns an error such as `` `temperature` is deprecated for this model``,
+its family may need a rule; see [Supporting a new model family](../README.md#supporting-a-new-model-family).
+OpenAI GPT models on Bedrock reject `temperature` and `max_tokens`; use `max_completion_tokens`.
+
+### Throttling (429)
+
+- Check the Bedrock service quotas for the model in the AWS console and request an increase if needed.
+- The gateway retries throttled calls a few times; add retries with backoff in your client for sustained load.
+
+### Remote images are rejected
+
+Remote image URLs are only fetched when they resolve to a publicly routable address, and URLs with
+credentials, backslashes or whitespace are refused. See the [Security Guide](./Security.md). Send the image as a
+base64 `data:` URL if it is not publicly reachable.
 
 ## Getting Help
 
@@ -84,14 +92,11 @@ If you're still experiencing issues:
 1. Check the CloudWatch Logs for detailed error messages
 2. Verify your AWS credentials and permissions
 3. Review the [Usage Guide](./Usage.md) for correct API usage
-4. Open a [GitHub issue](https://github.com/aws-samples/bedrock-access-gateway/issues/new?template=bug_report.md) with:
-   - Detailed error message
-   - Steps to reproduce
-   - Your deployment configuration (region, model, etc.)
-   - Any relevant CloudWatch logs
+4. Open an issue in this repository with the error message, steps to reproduce, the Region and model, and the
+   relevant log lines
 
 ## Additional Resources
 
 - [Amazon Bedrock Documentation](https://docs.aws.amazon.com/bedrock/)
-- [AWS IAM Documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/)
-- [AWS Systems Manager Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html)
+- [Supported models and Regions](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html)
+- [Amazon Bedrock quotas](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html)

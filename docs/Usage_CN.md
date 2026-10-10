@@ -1,5 +1,8 @@
 [English](./Usage.md)
 
+> [!NOTE]
+> 本中文文档未随此分支同步更新，推理（reasoning）、嵌入模型和模型参数等内容可能已过时。请以 [English](./Usage.md) 版本为准。
+
 # Usage Guide
 
 假设您在部署后已设置以下环境变量:
@@ -15,7 +18,7 @@ export OPENAI_BASE_URL=<API base url>
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
 - [Reasoning](#reasoning)
-- [Interleaved thinking (beta)](#Interleaved thinking (beta))
+- [Interleaved thinking (beta)](#interleaved-thinking-beta)
 
 
 ## Models API

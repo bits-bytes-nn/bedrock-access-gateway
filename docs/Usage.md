@@ -1,4 +1,4 @@
-[中文](./Usage_CN.md)
+[中文](./Usage_CN.md) (may lag behind this English guide)
 
 # Usage Guide
 
@@ -15,7 +15,7 @@ export OPENAI_BASE_URL=<API base url>
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
 - [Reasoning](#reasoning)
-- [Interleaved thinking (beta)](#Interleaved thinking (beta))
+- [Interleaved thinking (beta)](#interleaved-thinking-beta)
 
 ## Models API
 
@@ -96,6 +96,7 @@ print(completion.choices[0].message.content)
 2. If you are using OpenAI embedding models for encoded integers (such as with LangChain), this solution will attempt to decode the integers using `tiktoken` to retrieve the original text. However, there is no guarantee that the decoded text will be accurate.
 3. If you are using OpenAI embedding models for long texts, you should verify the maximum number of tokens supported for Bedrock models, e.g. for optimal performance, Bedrock recommends limiting the text length to less than 512 tokens.
 4. `dimensions` is supported for Titan Text Embeddings V2 (256, 512, 1024), Cohere Embed v4 (256, 512, 1024, 1536) and Nova embeddings; other models return `400` when it is set. Inference profile IDs such as `global.cohere.embed-v4:0` are accepted, which is required in Regions where a model is only served through a profile.
+5. Supported models: Amazon Titan Text Embeddings V1 and V2, Cohere Embed English/Multilingual v3 and v4, and Amazon Nova multimodal embeddings (text input only, default 3072 dimensions; 256, 384, 1024 or 3072). Availability differs by Region. OpenAI model names such as `text-embedding-3-small` use the `DEFAULT_EMBEDDING_MODEL` (Titan V2 by default). Cohere models embed inputs as `search_document`.
 
 
 **Example Request**
@@ -180,7 +181,6 @@ print(doc_result[0][:5])
 **Example Request**
 
 ```bash
-curl $OPENAI_BASE_URL/chat/completions \
 curl $OPENAI_BASE_URL/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -330,19 +330,20 @@ curl $OPENAI_BASE_URL/chat/completions \
 
 ```json
 {
-    "id": "msg_01PjrKDWhYGsrTNdeqzWd6D9",
+    "id": "chatcmpl-1a2b3c4d",
     "created": 1712543689,
-    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "model": "global.anthropic.claude-sonnet-5-5",
     "system_fingerprint": "fp",
     "choices": [
         {
             "index": 0,
-            "finish_reason": "stop",
+            "finish_reason": "tool_calls",
             "message": {
                 "role": "assistant",
+                "content": null,
                 "tool_calls": [
                     {
-                        "id": "0",
+                        "id": "tooluse_kZJMlvQmRJ6eAyJE5GIl7Q",
                         "type": "function",
                         "function": {
                             "name": "get_current_weather",
@@ -369,26 +370,41 @@ You can try it with different questions, such as:
 
 ## Reasoning
 
-**Important Notice**: Please carefully review the following points before using reasoning mode for Chat completion API.
-- Only Claude 3.7 Sonnet (extended thinking) and DeepSeek R1 support Reasoning so far. Please make sure the model supports reasoning before use.
-- For Claude 3.7 Sonnet, the reasoning mode (or thinking mode) is not enabled by default, you must pass additional `reasoning_effort` parameter in your request. Please also provide the right max_tokens (or max_completion_tokens) in your request. The budget_tokens is based on reasoning_effort (low: 30%, medium: 60%, high: 80% of max tokens), ensuring minimum budget_tokens of 1,024 with Anthropic recommending at least 4,000 tokens for comprehensive reasoning. Check [Bedrock Document](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-37.html) for more details.
-- For Claude Opus 4.7, Opus 4.8 and the Claude 5 family, `reasoning_effort` is mapped to adaptive thinking (`thinking.type: adaptive` with `output_config.effort`), so `max_tokens` is not required. These models reject `temperature` and `top_p`, so the gateway drops both from the request. Claude Opus 5.5 and Sonnet 5.5 also reject forced tool choice, so `tool_choice: "required"` or a named function falls back to `auto` for them.
-- For DeepSeek R1, you don't need additional reasoning_effort parameter, otherwise, you may get an error.
-- The reasoning response (CoT, thoughts) is added in an additional tag 'reasoning_content' which is not officially supported by OpenAI. This is to follow [Deepseek Reasoning Model](https://api-docs.deepseek.com/guides/reasoning_model#api-example). This may be changed in the future.
+Pass `reasoning_effort` (`low`, `medium` or `high`) to turn on reasoning for models that support it. How the
+gateway expresses it depends on the model family:
 
-> **Note**: Omitting `max_tokens` (or `max_completion_tokens`) now allows Bedrock to use the model's native maximum output (e.g., 64K for Claude Sonnet 4) rather than the previous 2048 implicit cap. Please set `max_tokens` explicitly if you need to control costs or latency.
+| Models | What `reasoning_effort` becomes | Notes |
+|---|---|---|
+| Claude Opus 4.7, Opus 4.8 and Claude 5.x | Adaptive thinking: `thinking.type: adaptive` with `output_config.effort` | `max_tokens` is not required. These models reject `temperature` and `top_p`, so both are dropped. |
+| Claude 3.7 Sonnet to Claude Opus 4.6 | Extended thinking with `budget_tokens` of 30% (low), 60% (medium) or 80% (high) of `max_tokens`, at least 1,024 | `max_tokens` (or `max_completion_tokens`) is required and must be above 1,024. `top_p` is dropped while thinking. |
+| DeepSeek V3 | `reasoning_config` set to the effort string | |
+| DeepSeek R1, OpenAI GPT, Kimi, GLM | Ignored; these models reason on their own | |
+
+Other per-model adjustments the gateway makes (see [`model_rules.py`](../src/api/models/model_rules.py)):
+
+- Claude 4.5 and 4.6 accept `temperature` or `top_p` but not both; `top_p` is dropped when both are set.
+- Claude 4.6 and later do not accept a conversation that ends with an assistant message (prefill). The gateway
+  appends a user message asking the model to continue.
+- Claude Opus 5.5 and Sonnet 5.5 reject forced tool choice, so `tool_choice: "required"` or a named function
+  falls back to `auto` for them.
+
+The reasoning text is returned inside the message content, wrapped in `<think>` and `</think>`, followed by
+the answer. In streaming responses the tags arrive as part of the content deltas. Models that return
+encrypted reasoning (OpenAI GPT) contribute no `<think>` block.
+
+> **Note**: Omitting `max_tokens` (or `max_completion_tokens`) lets Bedrock use the model's native maximum
+> output rather than a fixed cap. Set `max_tokens` explicitly if you need to control costs or latency.
 
 **Example Request**
-
-- Claude 3.7 Sonnet
 
 ```bash
 curl $OPENAI_BASE_URL/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "messages": [
+        {
             "role": "user",
             "content": "which one is bigger, 3.9 or 3.11?"
         }
@@ -399,31 +415,13 @@ curl $OPENAI_BASE_URL/chat/completions \
 }'
 ```
 
-- DeepSeek R1
-
-```bash
-curl $OPENAI_BASE_URL/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model": "us.deepseek.r1-v1:0",
-    "messages": [
-        {
-            "role": "user",
-            "content": "which one is bigger, 3.9 or 3.11?"
-        }
-    ],
-    "stream": false
-}'
-```
-
 **Example Response**
 
 ```json
 {
     "id": "chatcmpl-83fb7a88",
     "created": 1740545278,
-    "model": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "system_fingerprint": "fp",
     "choices": [
         {
@@ -432,8 +430,7 @@ curl $OPENAI_BASE_URL/chat/completions \
             "logprobs": null,
             "message": {
                 "role": "assistant",
-                "content": "3.9 is bigger than 3.11.\n\nWhen comparing decimal numbers, we need to understand what these numbers actually represent:...",
-                "reasoning_content": "I need to compare the decimal numbers 3.9 and 3.11.\n\nFor decimal numbers, we first compare the whole number parts, and if they're equal, we compare the decimal parts. \n\nBoth numbers ..."
+                "content": "<think>I need to compare the decimal numbers 3.9 and 3.11...</think>3.9 is bigger than 3.11..."
             }
         }
     ],
@@ -441,55 +438,32 @@ curl $OPENAI_BASE_URL/chat/completions \
     "usage": {
         "prompt_tokens": 51,
         "completion_tokens": 565,
-        "total_tokens": 616
+        "total_tokens": 616,
+        "completion_tokens_details": {"reasoning_tokens": 420, "audio_tokens": 0}
     }
 }
 ```
 
-You can also use OpenAI SDK (run `pip3 install -U openai` first )
-
-- Non-Streaming
+With the OpenAI SDK (`pip3 install -U openai`), split the reasoning from the answer:
 
 ```python
-from openai import OpenAI
-client = OpenAI()
+import re
 
-messages = [{"role": "user", "content": "which one is bigger, 3.9 or 3.11?"}]
+from openai import OpenAI
+
+client = OpenAI()
 response = client.chat.completions.create(
-    model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-    messages=messages,
+    model="global.anthropic.claude-opus-5-5",
+    messages=[{"role": "user", "content": "which one is bigger, 3.9 or 3.11?"}],
     reasoning_effort="low",
-    max_completion_tokens=4096,
 )
 
-reasoning_content = response.choices[0].message.reasoning_content
 content = response.choices[0].message.content
+match = re.match(r"<think>(.*?)</think>(.*)", content, re.DOTALL)
+reasoning, answer = match.groups() if match else ("", content)
 ```
 
-- Streaming
-
-```python
-from openai import OpenAI
-client = OpenAI()
-
-messages = [{"role": "user", "content": "9.11 and 9.8, which is greater?"}]
-response = client.chat.completions.create(
-    model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-    messages=messages,
-    reasoning_effort="low",
-    max_completion_tokens=4096,
-    stream=True,
-)
-
-reasoning_content = ""
-content = ""
-
-for chunk in response:
-    if hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
-        reasoning_content += chunk.choices[0].delta.reasoning_content
-    elif chunk.choices[0].delta.content:
-        content += chunk.choices[0].delta.content
-```
+When streaming, concatenate the content deltas and split the result the same way.
 
 ## Interleaved thinking (beta)
 
@@ -498,6 +472,9 @@ for chunk in response:
 Extended thinking with tool use in Claude 4 models supports [interleaved thinking](https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html#claude-messages-extended-thinking-tool-use-interleaved) enables Claude 4 models to think between tool calls and run more sophisticated reasoning after receiving tool results. which is helpful for more complex agentic interactions.
 With interleaved thinking, the `budget_tokens` can exceed the `max_tokens` parameter because it represents the total budget across all thinking blocks within one assistant turn.
 
+> **Note**: `thinking.type: enabled` with `budget_tokens` is rejected by Claude Opus 4.7, Opus 4.8 and Claude
+> 5.x, which only accept adaptive thinking. For those models use `reasoning_effort` instead of the examples below.
+
 **Supported Models**: Claude Sonnet 4, Claude Sonnet 4.5
 
 **Example Request**
@@ -505,9 +482,9 @@ With interleaved thinking, the `budget_tokens` can exceed the `max_tokens` param
 - Non-Streaming (Claude Sonnet 4.5)
 
 ```bash
-curl http://127.0.0.1:8000/api/v1/chat/completions \
+curl $OPENAI_BASE_URL/chat/completions \
 -H "Content-Type: application/json" \
--H "Authorization: Bearer bedrock" \
+-H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
 "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
 "max_tokens": 2048,
@@ -525,9 +502,9 @@ curl http://127.0.0.1:8000/api/v1/chat/completions \
 - Non-Streaming (Claude Sonnet 4)
 
 ```bash
-curl http://127.0.0.1:8000/api/v1/chat/completions \
+curl $OPENAI_BASE_URL/chat/completions \
 -H "Content-Type: application/json" \
--H "Authorization: Bearer bedrock" \
+-H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
 "model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
 "max_tokens": 2048,
@@ -545,9 +522,9 @@ curl http://127.0.0.1:8000/api/v1/chat/completions \
 - Streaming (Claude Sonnet 4.5)
 
 ```bash
-curl http://127.0.0.1:8000/api/v1/chat/completions \
+curl $OPENAI_BASE_URL/chat/completions \
 -H "Content-Type: application/json" \
--H "Authorization: Bearer bedrock" \
+-H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
 "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
 "max_tokens": 2048,
@@ -566,9 +543,9 @@ curl http://127.0.0.1:8000/api/v1/chat/completions \
 - Streaming (Claude Sonnet 4)
 
 ```bash
-curl http://127.0.0.1:8000/api/v1/chat/completions \
+curl $OPENAI_BASE_URL/chat/completions \
 -H "Content-Type: application/json" \
--H "Authorization: Bearer bedrock" \
+-H "Authorization: Bearer $OPENAI_API_KEY" \
 -d '{
 "model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
 "max_tokens": 2048,

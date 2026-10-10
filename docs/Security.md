@@ -91,6 +91,10 @@ On ECS/Fargate the notable targets are:
 - the EC2 instance metadata service, `169.254.169.254`
 - `localhost` and any VPC-internal service reachable from the task's subnet and security group
 
+On Lambda, credentials are passed as environment variables rather than served over HTTP, but `localhost`
+still exposes the Lambda Runtime API (`127.0.0.1:9001`) and the Lambda Web Adapter, and a VPC-attached
+function can reach VPC-internal services.
+
 ### What the gateway enforces
 
 Remote image URLs are validated in [`src/api/image_url.py`](../src/api/image_url.py) before any request
@@ -108,7 +112,7 @@ is made. A URL is only fetched when all of the following hold:
 | Content type | Normalised to a format Bedrock accepts (`image/jpeg`, `image/png`, `image/gif`, `image/webp`). |
 
 Rejected requests return `400` with a generic message, so error responses cannot be used to probe which
-internal hosts exist.
+internal hosts exist. An image over the size cap returns `413`.
 
 ### Recommended configuration
 
@@ -126,15 +130,18 @@ ENABLE_IMAGE_URL_FETCH=false
 IMAGE_URL_MAX_SIZE_MB=5
 ```
 
-Set these as environment variables on the ECS task definition or the Lambda function.
+For the Lambda stack, set them with the `EnableImageUrlFetch` and `ImageUrlAllowedHosts` stack parameters, so a
+later stack update does not undo them. For the Fargate stack, set them as environment variables on the task
+definition.
 
 In addition:
 
 - **Scope the task role.** This is the control that limits the damage if the credential endpoint is ever
-  reached. The bundled templates already grant the task role only `bedrock:InvokeModel`,
-  `bedrock:InvokeModelWithResponseStream`, `bedrock:ListFoundationModels` and
-  `bedrock:ListInferenceProfiles`. Keep it that narrow; credentials obtained through any future
-  SSRF-style issue then grant nothing beyond model invocation.
+  reached. The bundled templates grant the role only `bedrock:InvokeModel`,
+  `bedrock:InvokeModelWithResponseStream`, `bedrock:ListFoundationModels`,
+  `bedrock:ListInferenceProfiles` and `secretsmanager:GetSecretValue` on the API key secret (plus
+  CloudWatch Logs). Keep it that narrow; credentials obtained through any future SSRF-style issue then grant
+  nothing beyond model invocation.
 - **Restrict egress** to limit which VPC-internal services and internet hosts the task can reach. Note
   the limit of this control: security groups do **not** filter link-local traffic, so an egress rule
   cannot protect the container credential endpoint at `169.254.170.2` or the EC2 instance metadata
@@ -146,8 +153,9 @@ In addition:
 
 ### If you deployed an earlier version
 
-Deployments created before this hardening was added pass the caller-supplied image URL straight to the
-HTTP client with no validation. If you are running the gateway from an image built before this change,
+Images built before the image URL checks pass the caller-supplied URL straight to the HTTP client with no
+validation. Images built from the first version of the checks (before 2026-10-10 in this fork) can be bypassed
+with URLs such as `http://169.254.169.254\@example.com/`, and are open to DNS rebinding. If you run either,
 treat it as exposed to the SSRF vector described above.
 
 **Redeploy** from the current version, or rebuild your container image from the current source. See

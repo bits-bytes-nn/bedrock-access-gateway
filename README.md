@@ -2,28 +2,23 @@
 
 OpenAI-compatible RESTful APIs for Amazon Bedrock
 
-> [!IMPORTANT]
-> **This project is deprecated.** Amazon Bedrock now serves OpenAI-compatible and
-> Anthropic-compatible APIs natively, which is the reason this proxy existed. Call Amazon Bedrock
-> directly instead of deploying this gateway.
-
-## Migrating to native Amazon Bedrock APIs
-
-Point your SDK at the [`bedrock-mantle`](https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html) endpoint:
-
-- **Claude models** — native [Anthropic Messages API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-messages-api.html), so the Anthropic SDKs work unchanged.
-- **GPT and other first- and third-party models** — OpenAI-compatible [Chat Completions](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions-mantle.html) and [Responses](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html) APIs, so the OpenAI SDKs work unchanged.
-
-Beyond replacing this proxy, `bedrock-mantle` adds per-application [cost attribution](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-projects.html), server-side tools, background inference and higher throughput limits. See [Endpoints supported by Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html) to compare it with `bedrock-runtime`.
+> [!NOTE]
+> **About this fork.** The upstream project ([aws-samples/bedrock-access-gateway](https://github.com/aws-samples/bedrock-access-gateway))
+> is deprecated, because Amazon Bedrock now serves OpenAI- and Anthropic-compatible APIs natively. This fork
+> is maintained for clients that still talk to the gateway. It adds request rules for current Claude and
+> OpenAI models, a hardened image URL fetch, and fixes listed in the [changelog](./CHANGELOG.md).
+>
+> For new applications, prefer calling Amazon Bedrock directly: the `bedrock-runtime` endpoint serves the
+> [Anthropic Messages API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-messages-api.html) and
+> OpenAI-compatible [Chat Completions](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions.html).
+> See [Endpoints supported by Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html).
 
 ## Overview
 
-Amazon Bedrock offers a wide range of foundation models (such as Claude 3 Opus/Sonnet/Haiku, Llama 2/3, Mistral/Mixtral,
-etc.) and a broad set of capabilities for you to build generative AI applications. Check the [Amazon Bedrock](https://aws.amazon.com/bedrock) landing page for additional information.
+Amazon Bedrock offers a wide range of foundation models (such as Anthropic Claude, OpenAI GPT, Amazon Nova, Kimi, GLM
+and many more) and a broad set of capabilities for you to build generative AI applications. Check the [Amazon Bedrock](https://aws.amazon.com/bedrock) landing page for additional information.
 
 Sometimes, you might have applications developed using OpenAI APIs or SDKs, and you want to experiment with Amazon Bedrock without modifying your codebase. Or you may simply wish to evaluate the capabilities of these foundation models in tools like AutoGen etc. Well, this repository allows you to access Amazon Bedrock models seamlessly through OpenAI APIs and SDKs, enabling you to test these models without code changes.
-
-If you find this GitHub repository useful, please consider giving it a free star ⭐ to show your appreciation and support for the project.
 
 **Features:**
 
@@ -69,7 +64,10 @@ You can also use Lambda Function URL as an alternative, see [example](https://gi
 
 ### Deployment
 
-Please follow the steps below to deploy the Bedrock Proxy APIs into your AWS account. Only supports regions where Amazon Bedrock is available (such as `us-west-2`). The deployment will take approximately **10-15 minutes** 🕒.
+Please follow the steps below to deploy the Bedrock Proxy APIs into your AWS account. Only supports regions where Amazon Bedrock is available (such as `us-west-2`). The deployment will take approximately **10-15 minutes**.
+
+The steps below use the console. For the API Gateway + Lambda option, [`scripts/deploy-lambda.sh`](scripts/deploy-lambda.sh)
+replaces Steps 2 and 3 for an existing stack, see [How to upgrade?](#how-to-upgrade).
 
 **Step 1: Create your own API key in Secrets Manager (MUST)**
 
@@ -96,7 +94,7 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/aws-samples/bedrock-access-gateway.git
+   git clone https://github.com/bits-bytes-nn/bedrock-access-gateway.git
    cd bedrock-access-gateway
    ```
 
@@ -114,6 +112,8 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 4. The script will build and push both Lambda and ECS/Fargate images to your ECR repositories.
 
 5. **Important**: Copy the image URIs displayed at the end of the script output. You'll need these in the next step.
+   Prefer a unique tag (for example the git commit) over `latest`: CloudFormation only redeploys the
+   function when the image URI changes.
 
 **Step 3: Deploy the CloudFormation stack**
 
@@ -131,7 +131,11 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
    - **Stack name**: Enter a stack name (e.g., "BedrockProxyAPI")
    - **ApiKeySecretArn**: Enter the secret ARN from Step 1
    - **ContainerImageUri**: Enter the ECR image URI from Step 2 output
-   - **DefaultModelId**: (Optional) Change the default model if needed
+   - **DefaultModelId**: (Optional) Model used for OpenAI model names such as `gpt-4o` (default `global.anthropic.claude-opus-5-5`)
+   - **DefaultEmbeddingModelId**: (Optional) Model used for OpenAI embedding model names such as `text-embedding-3-small` (default `amazon.titan-embed-text-v2:0`)
+   - **EnablePromptCaching**: (Optional) Add cache points for models that support prompt caching
+   - **EnableImageUrlFetch**, **ImageUrlAllowedHosts**: (Optional) Controls for remote image URLs, see the [Security Guide](./docs/Security.md)
+   - **LogRetentionInDays**: (Optional) How long the function logs are kept (default 90)
 
    Click "Next".
 
@@ -139,7 +143,7 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 
 7. On the "Review" page, review all details. Check the "I acknowledge that AWS CloudFormation might create IAM resources" checkbox at the bottom. Click "Submit".
 
-That is it! 🎉 Once deployed, click the CloudFormation stack and go to **Outputs** tab, you can find the API Base URL from `APIBaseUrl`, the value should look like `http://xxxx.xxx.elb.amazonaws.com/api/v1`.
+That is it! Once deployed, click the CloudFormation stack and go to **Outputs** tab, you can find the API Base URL from `APIBaseUrl`. For API Gateway + Lambda it looks like `https://xxxx.execute-api.<region>.amazonaws.com/api/v1`; for ALB + Fargate, `http://xxxx.xxx.elb.amazonaws.com/api/v1`.
 
 ### Troubleshooting
 
@@ -149,7 +153,7 @@ If you encounter any issues, please check the [Troubleshooting Guide](./docs/Tro
 
 All you need is the API Key and the API Base URL. If you didn't set up your own key following Step 1, the application will fail to start with an error message indicating that the API Key is not configured.
 
-Now, you can try out the proxy APIs. Let's say you want to test Claude 3 Sonnet model (model ID: `anthropic.claude-3-sonnet-20240229-v1:0`)...
+Now, you can try out the proxy APIs. Let's say you want to test Claude Opus 5.5 through its global inference profile (model ID: `global.anthropic.claude-opus-5-5`)...
 
 **Example API Usage**
 
@@ -166,7 +170,7 @@ curl $OPENAI_BASE_URL/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "model": "global.anthropic.claude-opus-5-5",
     "messages": [
       {
         "role": "user",
@@ -183,7 +187,7 @@ from openai import OpenAI
 
 client = OpenAI()
 completion = client.chat.completions.create(
-    model="anthropic.claude-3-sonnet-20240229-v1:0",
+    model="global.anthropic.claude-opus-5-5",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 
@@ -240,17 +244,17 @@ For more information about creating and managing application inference profiles,
 This proxy now supports **Prompt Caching** for Claude and Nova models, which can reduce costs by up to 90% and latency by up to 85% for workloads with repeated prompts.
 
 **Supported Models:**
-- Claude models (Claude 3.5 Haiku, Claude 4, Claude 4.5, etc.)
+- Claude 3.7 Sonnet, Claude 3.5 Haiku and every later Claude model (Claude 4.x, Claude 5.x)
 - Nova models (Nova Micro, Nova Lite, Nova Pro, Nova Premier)
+
+Cache points are never added for other models, even when caching is enabled, because Bedrock rejects them
+(for example Claude 3 Haiku and Claude 3.5 Sonnet).
 
 **Enabling Prompt Caching:**
 
 You can enable prompt caching in two ways:
 
-1. **Globally via Environment Variable** (set in ECS Task Definition or Lambda):
-```bash
-ENABLE_PROMPT_CACHING=true
-```
+1. **Globally** with the `EnablePromptCaching` stack parameter (the `ENABLE_PROMPT_CACHING` environment variable).
 
 2. **Per-request via `extra_body`** :
 
@@ -303,9 +307,9 @@ curl $OPENAI_BASE_URL/chat/completions \
 - `"prompt_caching": {"system": true, "messages": true}` - Cache both
 
 **Requirements:**
-- Prompt must be ≥1,024 tokens to enable caching
+- A prompt prefix shorter than the model's minimum (1,024 tokens for most Claude models) is not cached
 - Cache TTL is 5 minutes (resets on each cache hit)
-- Nova models have a 20,000 token caching limit
+- See the guide below for the per-model minimums and limits
 
 For more information, see the [Amazon Bedrock Prompt Caching Guide](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
 
@@ -324,7 +328,7 @@ from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
 chat = ChatOpenAI(
-    model="anthropic.claude-3-sonnet-20240229-v1:0",
+    model="global.anthropic.claude-opus-5-5",
     temperature=0,
     openai_api_key=os.environ['OPENAI_API_KEY'],
     openai_api_base=os.environ['OPENAI_BASE_URL'],
@@ -367,13 +371,13 @@ You can use the [Models API](./docs/Usage.md#models-api) to get/refresh a list o
 
 ### Can I run this locally
 
-Yes, you can run this locally, e.g. run below command under `src` folder:
+Yes. With AWS credentials in your environment and an API key of your choice, run under the `src` folder:
 
 ```bash
-uvicorn api.app:app --host 0.0.0.0 --port 8000
+API_KEY=<any key> AWS_REGION=<region> uvicorn api.app:app --host 0.0.0.0 --port 8080
 ```
 
-The API base url should look like `http://localhost:8000/api/v1`.
+The API base url should look like `http://localhost:8080/api/v1`. See [Configuration](#configuration) for the other settings.
 
 ### Any performance sacrifice or latency increase by using the proxy APIs
 
@@ -391,13 +395,68 @@ Fine-tuned models and models with Provisioned Throughput are currently not suppo
 
 ### How to upgrade?
 
-To use the latest features, you need follow the deployment guide to redeploy the application. You can upgrade the existing CloudFormation stack to get the latest changes.
+For the API Gateway + Lambda stack, build the image from the current commit and deploy it through the stack:
+
+```bash
+# Creates a change set to review without applying it
+AWS_REGION=<region> STACK_NAME=<stack name> scripts/deploy-lambda.sh --preview
+# Builds, pushes and deploys
+AWS_REGION=<region> STACK_NAME=<stack name> scripts/deploy-lambda.sh
+```
+
+The script tags the image with the git commit, pins `ContainerImageUri` to the pushed digest, applies the
+current template and keeps every other parameter's value. Pass overrides with `PARAMETERS="Key=Value ..."`.
+To roll back, check out the earlier commit and run the script again.
+
+For the Fargate stack, push new images with `scripts/push-to-ecr.sh` and update the stack.
+
+## Configuration
+
+The application reads these environment variables. The Lambda template sets them from its parameters.
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_KEY_SECRET_ARN` | | Secrets Manager secret holding `{"api_key": "..."}`. One of the three API key settings is required. |
+| `API_KEY_PARAM_NAME` | | SSM parameter holding the API key (legacy) |
+| `API_KEY` | | The API key itself, for local runs |
+| `AWS_REGION` | `us-west-2` | Region used for Bedrock calls |
+| `API_ROUTE_PREFIX` | `/api/v1` | Path prefix of the API routes |
+| `DEFAULT_MODEL` | `global.anthropic.claude-opus-5-5` | Model used for OpenAI model names (`gpt-*`) |
+| `DEFAULT_EMBEDDING_MODEL` | `amazon.titan-embed-text-v2:0` | Model used for OpenAI embedding model names (`text-embedding-*`) |
+| `ENABLE_CROSS_REGION_INFERENCE` | `true` | List system-defined inference profiles as models |
+| `ENABLE_APPLICATION_INFERENCE_PROFILES` | `true` | List application inference profiles as models |
+| `ENABLE_PROMPT_CACHING` | `false` | Add cache points for models that support prompt caching |
+| `ENABLE_IMAGE_URL_FETCH` | `true` | Allow remote http(s) image URLs |
+| `IMAGE_URL_ALLOWED_HOSTS` | | Comma-separated hosts remote image URLs may point at |
+| `IMAGE_URL_MAX_SIZE_MB` | `10` | Maximum size of a fetched image |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `DEBUG` | `false` | Log requests and responses, including prompts. Do not enable with sensitive data. |
+
+Boolean settings accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); any other value stops the application at startup.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt   # or: uv pip install -r requirements-dev.txt
+ruff check . && ruff format --check .
+pytest
+```
+
+The tests replace the AWS clients with mocks and never call AWS. CI runs the same commands on every push and pull request.
+
+### Supporting a new model family
+
+Per-model request rules (sampling parameters, thinking, assistant prefill, tool choice, prompt caching) live in
+[`src/api/models/model_rules.py`](src/api/models/model_rules.py). Claude models are matched by family and version,
+and a version newer than every rule inherits the newest rules. To support a model that behaves differently, call it
+directly through the Converse API to find what it accepts, add a row to
+[`test/test_model_rules.py`](test/test_model_rules.py), then update `model_rules.py` until the test passes.
 
 ## Security
 
 See the [Security Guide](./docs/Security.md) for how to enable HTTPS on the ALB and how to configure the
-controls around remote image URL fetching in the multimodal API. If you deployed before those controls
-were added, read [If you deployed an earlier version](./docs/Security.md#if-you-deployed-an-earlier-version).
+controls around remote image URL fetching in the multimodal API. If you deployed an image built before
+the current fetch checks, read [If you deployed an earlier version](./docs/Security.md#if-you-deployed-an-earlier-version).
 
 To report a security issue, see [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications).
 
