@@ -85,9 +85,7 @@ def _claude_rules(family: str, version: tuple[int, int]) -> ModelRules:
         sampling, thinking = Sampling.BOTH, Thinking.BUDGET
 
     # Fable and Mythos reject forced tool choice in every version; Opus and Sonnet from 5.5.
-    forced_tool_choice = not (
-        family in {"fable", "mythos"} or (family in {"opus", "sonnet"} and version >= (5, 5))
-    )
+    forced_tool_choice = not (family in {"fable", "mythos"} or (family in {"opus", "sonnet"} and version >= (5, 5)))
 
     return ModelRules(
         sampling=sampling,

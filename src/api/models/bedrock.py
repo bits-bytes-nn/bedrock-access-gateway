@@ -98,6 +98,7 @@ def bedrock_error_to_http(error: Exception, model_id: str) -> HTTPException:
     logger.error("Bedrock invocation failed for model %s", model_id, exc_info=error)
     return HTTPException(status_code=500, detail="Internal error while calling Amazon Bedrock")
 
+
 bedrock_runtime = boto3.client(
     service_name="bedrock-runtime",
     region_name=AWS_REGION,
@@ -135,6 +136,7 @@ MIN_THINKING_BUDGET_TOKENS = 1024
 # most 20 images per request for most models anyway.
 MAX_REMOTE_IMAGES_PER_REQUEST = 20
 
+
 def list_bedrock_models() -> dict:
     """Automatically getting a list of supported models.
 
@@ -149,7 +151,7 @@ def list_bedrock_models() -> dict:
     try:
         if ENABLE_CROSS_REGION_INFERENCE:
             # List system defined inference profile IDs and store underlying model mapping
-            paginator = bedrock_client.get_paginator('list_inference_profiles')
+            paginator = bedrock_client.get_paginator("list_inference_profiles")
             for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
                 for profile in page["inferenceProfileSummaries"]:
                     profile_id = profile.get("inferenceProfileId")
@@ -162,7 +164,7 @@ def list_bedrock_models() -> dict:
                         model_arn = models[0].get("modelArn", "")
                         if model_arn:
                             # Extract foundation model ID from ARN
-                            model_id = model_arn.split('/')[-1]
+                            model_id = model_arn.split("/")[-1]
                             metadata[profile_id] = {
                                 "underlying_model_id": model_id,
                                 "profile_type": "SYSTEM_DEFINED",
@@ -170,7 +172,7 @@ def list_bedrock_models() -> dict:
 
         if ENABLE_APPLICATION_INFERENCE_PROFILES:
             # List application defined inference profile IDs and create mapping
-            paginator = bedrock_client.get_paginator('list_inference_profiles')
+            paginator = bedrock_client.get_paginator("list_inference_profiles")
             for page in paginator.paginate(maxResults=1000, typeEquals="APPLICATION"):
                 for profile in page["inferenceProfileSummaries"]:
                     try:
@@ -191,7 +193,7 @@ def list_bedrock_models() -> dict:
                             continue
 
                         # Extract model ID from ARN (works for both foundation models and cross-region profiles)
-                        model_id = model_arn.split('/')[-1] if '/' in model_arn else model_arn
+                        model_id = model_arn.split("/")[-1] if "/" in model_arn else model_arn
 
                         # Store in unified profile metadata for feature detection
                         metadata[profile_arn] = {
@@ -292,7 +294,9 @@ class BedrockModel(BaseChatModel):
                     f"the profile exists in your AWS account."
                 )
             else:
-                error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
+                error = (
+                    f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
+                )
             logger.error("Unsupported model: %s", chat_request.model)
 
         if error:
@@ -339,9 +343,7 @@ class BedrockModel(BaseChatModel):
             if chat_request.model in profile_metadata:
                 resolved = self._resolve_to_foundation_model(chat_request.model)
                 profile_type = profile_metadata[chat_request.model].get("profile_type", "UNKNOWN")
-                logger.info(
-                    f"Profile resolution: {chat_request.model} ({profile_type}) → {resolved}"
-                )
+                logger.info(f"Profile resolution: {chat_request.model} ({profile_type}) → {resolved}")
 
         # Convert the OpenAI request to a Bedrock request. This can fetch remote
         # images, so it runs in the thread pool to keep the event loop free.
@@ -536,9 +538,7 @@ class BedrockModel(BaseChatModel):
                 messages.append(
                     {
                         "role": message.role,
-                        "content": self._parse_content_parts(
-                            message, chat_request.model
-                        ),
+                        "content": self._parse_content_parts(message, chat_request.model),
                     }
                 )
             elif isinstance(message, AssistantMessage):
@@ -658,9 +658,7 @@ class BedrockModel(BaseChatModel):
             # If the next role is different from the previous message, add the previous role's messages to the list
             if next_role != current_role:
                 if current_content:
-                    reformatted_messages.append(
-                        {"role": current_role, "content": current_content}
-                    )
+                    reformatted_messages.append({"role": current_role, "content": current_content})
                 # Switch to the new role
                 current_role = next_role
                 current_content = []
@@ -673,9 +671,7 @@ class BedrockModel(BaseChatModel):
 
         # Add the last role's messages to the list
         if current_content:
-            reformatted_messages.append(
-                {"role": current_role, "content": current_content}
-            )
+            reformatted_messages.append({"role": current_role, "content": current_content})
 
         # Bedrock Converse API requires conversations to end with a user message.
         # Some models don't support "assistant message prefill".
@@ -683,12 +679,13 @@ class BedrockModel(BaseChatModel):
         # add a user message asking to continue - but only for models that reject prefill.
         if chat_request and reformatted_messages and reformatted_messages[-1]["role"] == "assistant":
             if not self._rules(chat_request.model).prefill:
-                reformatted_messages.append({
-                    "role": "user",
-                    "content": [{"text": "Please continue your response from where you left off."}]
-                })
+                reformatted_messages.append(
+                    {"role": "user", "content": [{"text": "Please continue your response from where you left off."}]}
+                )
                 if DEBUG:
-                    logger.info(f"Added continuation prompt for {chat_request.model} - conversation ended with assistant message")
+                    logger.info(
+                        f"Added continuation prompt for {chat_request.model} - conversation ended with assistant message"
+                    )
 
         # Add cachePoint to messages if enabled and supported
         if chat_request and reformatted_messages:
@@ -854,10 +851,7 @@ class BedrockModel(BaseChatModel):
         # Add additional fields to enable extend thinking or other model-specific features
         if chat_request.extra_body:
             # Filter out prompt_caching (our control field, not for Bedrock)
-            additional_fields = {
-                k: v for k, v in chat_request.extra_body.items()
-                if k != "prompt_caching"
-            }
+            additional_fields = {k: v for k, v in chat_request.extra_body.items() if k != "prompt_caching"}
 
             if additional_fields:
                 # Merge with existing additionalModelRequestFields (e.g., from reasoning_effort)
@@ -874,11 +868,7 @@ class BedrockModel(BaseChatModel):
 
     @staticmethod
     def _has_tool_blocks(messages: list[dict]) -> bool:
-        return any(
-            "toolUse" in block or "toolResult" in block
-            for message in messages
-            for block in message["content"]
-        )
+        return any("toolUse" in block or "toolResult" in block for message in messages for block in message["content"])
 
     def _estimate_reasoning_tokens(self, content: list[dict]) -> int:
         """
@@ -991,9 +981,7 @@ class BedrockModel(BaseChatModel):
         response.created = int(time.time())
         return response
 
-    def _create_response_stream(
-        self, model_id: str, message_id: str, chunk: dict
-    ) -> ChatStreamResponse | None:
+    def _create_response_stream(self, model_id: str, message_id: str, chunk: dict) -> ChatStreamResponse | None:
         """Parsing the Bedrock stream response chunk.
 
         Ref: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#message-inference-examples
@@ -1212,9 +1200,7 @@ class BedrockModel(BaseChatModel):
             tool_spec["description"] = func.description
         return {"toolSpec": tool_spec}
 
-    def _calc_budget_tokens(
-        self, max_tokens: int, reasoning_effort: Literal["low", "medium", "high"]
-    ) -> int:
+    def _calc_budget_tokens(self, max_tokens: int, reasoning_effort: Literal["low", "medium", "high"]) -> int:
         # Helper function to calculate budget_tokens based on the max_tokens.
         # Ratio for efforts: low - 30%, medium - 60%, high - 80%. High leaves room for
         # the answer; spending almost all of max_tokens on thinking returns empty content.

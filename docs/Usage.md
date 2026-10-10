@@ -82,7 +82,12 @@ from openai import OpenAI
 client = OpenAI()
 completion = client.chat.completions.create(
     model="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    messages=[{"role": "user", "content": "Write a Python function to calculate the Fibonacci sequence using dynamic programming."}],
+    messages=[
+        {
+            "role": "user",
+            "content": "Write a Python function to calculate the Fibonacci sequence using dynamic programming.",
+        }
+    ],
 )
 
 print(completion.choices[0].message.content)
@@ -146,9 +151,11 @@ from openai import OpenAI
 
 client = OpenAI()
 
+
 def get_embedding(text, model="text-embedding-3-small"):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model=model).data[0].embedding
+
 
 text = "hello"
 # will output like [0.003578186, 0.028717041, 0.031021118, -0.0014066696,...]

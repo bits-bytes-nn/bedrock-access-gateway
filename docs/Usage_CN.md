@@ -144,9 +144,11 @@ from openai import OpenAI
 
 client = OpenAI()
 
+
 def get_embedding(text, model="text-embedding-3-small"):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model=model).data[0].embedding
+
 
 text = "hello"
 # will output like [0.003578186, 0.028717041, 0.031021118, -0.0014066696,...]
@@ -451,6 +453,7 @@ curl $OPENAI_BASE_URL/chat/completions \
 
 ```python
 from openai import OpenAI
+
 client = OpenAI()
 
 messages = [{"role": "user", "content": "which one is bigger, 3.9 or 3.11?"}]
@@ -469,6 +472,7 @@ content = response.choices[0].message.content
 
 ```python
 from openai import OpenAI
+
 client = OpenAI()
 
 messages = [{"role": "user", "content": "9.11 and 9.8, which is greater?"}]
@@ -484,7 +488,7 @@ reasoning_content = ""
 content = ""
 
 for chunk in response:
-    if hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content:
+    if hasattr(chunk.choices[0].delta, "reasoning_content") and chunk.choices[0].delta.reasoning_content:
         reasoning_content += chunk.choices[0].delta.reasoning_content
     elif chunk.choices[0].delta.content:
         content += chunk.choices[0].delta.content

@@ -50,9 +50,7 @@ def test_temperature_kept_for_older_models(gateway, model_id):
 
 def test_sampling_params_dropped_for_application_profile(gateway, monkeypatch):
     arn = "arn:aws:bedrock:ap-northeast-2:123456789012:application-inference-profile/abc"
-    monkeypatch.setitem(
-        bedrock_module.profile_metadata, arn, {"underlying_model_id": "anthropic.claude-opus-5-5"}
-    )
+    monkeypatch.setitem(bedrock_module.profile_metadata, arn, {"underlying_model_id": "anthropic.claude-opus-5-5"})
     args = build(gateway, model=arn, max_tokens=100, temperature=0.5)
     assert "temperature" not in args["inferenceConfig"]
 
@@ -68,9 +66,7 @@ def test_reasoning_effort_maps_to_adaptive_thinking(gateway, model_id):
 
 def test_reasoning_effort_uses_budget_for_older_claude(gateway):
     args = build(gateway, model=OLDER_CLAUDE[0], max_tokens=4000, reasoning_effort="medium")
-    assert args["additionalModelRequestFields"] == {
-        "reasoning_config": {"type": "enabled", "budget_tokens": 2400}
-    }
+    assert args["additionalModelRequestFields"] == {"reasoning_config": {"type": "enabled", "budget_tokens": 2400}}
 
 
 def test_reasoning_budget_raised_to_bedrock_minimum(gateway):

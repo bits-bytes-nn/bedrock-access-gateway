@@ -269,13 +269,11 @@ response = client.chat.completions.create(
     model="global.anthropic.claude-haiku-4-5-20251001-v1:0",
     messages=[
         {"role": "system", "content": "You are an expert assistant with knowledge of..."},
-        {"role": "user", "content": "Help me with this task"}
+        {"role": "user", "content": "Help me with this task"},
     ],
     # The SDK merges extra_body into the top-level request, so nest it once more
     # to send the gateway's own "extra_body" field.
-    extra_body={
-        "extra_body": {"prompt_caching": {"system": True}}
-    }
+    extra_body={"extra_body": {"prompt_caching": {"system": True}}},
 )
 
 # Check cache hit
@@ -330,8 +328,8 @@ from langchain_openai import ChatOpenAI
 chat = ChatOpenAI(
     model="global.anthropic.claude-opus-5-5",
     temperature=0,
-    openai_api_key=os.environ['OPENAI_API_KEY'],
-    openai_api_base=os.environ['OPENAI_BASE_URL'],
+    openai_api_key=os.environ["OPENAI_API_KEY"],
+    openai_api_base=os.environ["OPENAI_BASE_URL"],
 )
 
 template = """Question: {question}
@@ -344,7 +342,6 @@ llm_chain = LLMChain(prompt=prompt, llm=chat)
 question = "What NFL team won the Super Bowl in the year Justin Beiber was born?"
 response = llm_chain.invoke(question)
 print(response)
-
 ```
 
 ## FAQs

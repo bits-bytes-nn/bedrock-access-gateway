@@ -28,7 +28,9 @@ origins_list = [origin.strip() for origin in allowed_origins.split(",")] if allo
 
 # Warn if CORS allows all origins
 if origins_list == ["*"]:
-    logging.warning("CORS is configured to allow all origins (*). Set ALLOWED_ORIGINS environment variable to restrict access.")
+    logging.warning(
+        "CORS is configured to allow all origins (*). Set ALLOWED_ORIGINS environment variable to restrict access."
+    )
 
 app.add_middleware(
     CORSMiddleware,

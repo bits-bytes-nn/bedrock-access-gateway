@@ -120,12 +120,14 @@ class ChatRequest(BaseModel):
 
 class PromptTokensDetails(BaseModel):
     """Details about prompt tokens usage, following OpenAI API format."""
+
     cached_tokens: int = 0
     audio_tokens: int = 0
 
 
 class CompletionTokensDetails(BaseModel):
     """Details about completion tokens usage, following OpenAI API format."""
+
     reasoning_tokens: int = 0
     audio_tokens: int = 0
 

@@ -26,9 +26,7 @@ def runtime(monkeypatch):
     """A fresh mock of the bedrock-runtime client for each test."""
     fake = bedrock_module.bedrock_runtime.__class__()
     monkeypatch.setattr(bedrock_module, "bedrock_runtime", fake)
-    monkeypatch.setattr(
-        bedrock_module, "bedrock_model_list", {CHAT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
-    )
+    monkeypatch.setattr(bedrock_module, "bedrock_model_list", {CHAT_MODEL: {"modalities": ["TEXT", "IMAGE"]}})
     return fake
 
 
@@ -232,7 +230,9 @@ def stream_chunks(client, runtime, events):
 
 def test_stream_tool_call_indexes_count_tool_calls_only(client, runtime):
     def tool_start(block, tool_id):
-        return {"contentBlockStart": {"contentBlockIndex": block, "start": {"toolUse": {"toolUseId": tool_id, "name": "f"}}}}
+        return {
+            "contentBlockStart": {"contentBlockIndex": block, "start": {"toolUse": {"toolUseId": tool_id, "name": "f"}}}
+        }
 
     def tool_delta(block):
         return {"contentBlockDelta": {"contentBlockIndex": block, "delta": {"toolUse": {"input": "{}"}}}}
@@ -249,7 +249,9 @@ def test_stream_tool_call_indexes_count_tool_calls_only(client, runtime):
             {"messageStop": {"stopReason": "tool_use"}},
         ],
     )
-    indexes = [c["choices"][0]["delta"]["tool_calls"][0]["index"] for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+    indexes = [
+        c["choices"][0]["delta"]["tool_calls"][0]["index"] for c in chunks if c["choices"][0]["delta"].get("tool_calls")
+    ]
     assert indexes == [0, 0, 1, 1]
 
 
@@ -321,7 +323,9 @@ def test_titan_v2_passes_dimensions(client, runtime):
 def test_cohere_splits_large_batches_and_reports_usage(client, runtime):
     def cohere_response(body, **_kwargs):
         texts = json.loads(body)["texts"]
-        return invoke_result({"embeddings": [[0.1]] * len(texts)}, {"x-amzn-bedrock-input-token-count": str(len(texts))})
+        return invoke_result(
+            {"embeddings": [[0.1]] * len(texts)}, {"x-amzn-bedrock-input-token-count": str(len(texts))}
+        )
 
     runtime.invoke_model.side_effect = cohere_response
     response = embed(client, model="cohere.embed-multilingual-v3", input=["t"] * 100)
@@ -366,7 +370,9 @@ def test_too_many_remote_images_are_rejected_before_fetching(client, runtime, mo
     assert response.status_code == 400
 
 
-@pytest.mark.parametrize("model,expected", [("global.anthropic.claude-sonnet-5-5", "auto"), ("global.anthropic.claude-haiku-5-5", "any")])
+@pytest.mark.parametrize(
+    "model,expected", [("global.anthropic.claude-sonnet-5-5", "auto"), ("global.anthropic.claude-haiku-5-5", "any")]
+)
 def test_forced_tool_choice_falls_back_where_unsupported(client, runtime, monkeypatch, model, expected):
     monkeypatch.setitem(bedrock_module.bedrock_model_list, model, {"modalities": ["TEXT"]})
     runtime.converse.return_value = converse_result([{"text": "ok"}])
@@ -411,7 +417,10 @@ def test_model_discovery_maps_profiles_to_models(monkeypatch):
     fake = bedrock_module.bedrock_client.__class__()
     profiles = {
         "SYSTEM_DEFINED": [
-            {"inferenceProfileId": "global.anthropic.claude-opus-5-5", "models": [{"modelArn": "arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5"}]}
+            {
+                "inferenceProfileId": "global.anthropic.claude-opus-5-5",
+                "models": [{"modelArn": "arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5"}],
+            }
         ],
         "APPLICATION": [
             {
@@ -492,7 +501,9 @@ def cache_points(args):
         ("apac.anthropic.claude-3-haiku-20240307-v1:0", True, None, (0, 0)),
     ],
 )
-def test_cache_points_follow_settings_and_model_support(client, runtime, monkeypatch, model, enabled, extra_body, expected):
+def test_cache_points_follow_settings_and_model_support(
+    client, runtime, monkeypatch, model, enabled, extra_body, expected
+):
     monkeypatch.setattr(bedrock_module, "ENABLE_PROMPT_CACHING", enabled)
     monkeypatch.setitem(bedrock_module.bedrock_model_list, model, {"modalities": ["TEXT"]})
     runtime.converse.return_value = converse_result([{"text": "ok"}])
@@ -526,7 +537,10 @@ def test_tool_results_keep_text_and_images(client, runtime):
     runtime.converse.return_value = converse_result([{"text": "ok"}])
     messages = [
         {"role": "user", "content": "look"},
-        {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        },
         {
             "role": "tool",
             "tool_call_id": "t1",
@@ -557,7 +571,11 @@ def test_usage_counts_cached_tokens(client, runtime):
     result["usage"] = {"inputTokens": 3, "outputTokens": 2, "totalTokens": 25, "cacheReadInputTokens": 20}
     runtime.converse.return_value = result
     usage = chat(client).json()["usage"]
-    assert (usage["prompt_tokens"], usage["completion_tokens"], usage["prompt_tokens_details"]["cached_tokens"]) == (23, 2, 20)
+    assert (usage["prompt_tokens"], usage["completion_tokens"], usage["prompt_tokens_details"]["cached_tokens"]) == (
+        23,
+        2,
+        20,
+    )
 
 
 @pytest.mark.parametrize("stream_options,expect_usage", [({"include_usage": True}, True), ({}, False), (None, False)])
