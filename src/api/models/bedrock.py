@@ -1,12 +1,13 @@
 import base64
 import json
 import logging
+import struct
+import threading
 import time
 from abc import ABC
 from typing import AsyncIterable, Literal
 
 import boto3
-import numpy as np
 import tiktoken
 from botocore.config import Config
 from botocore.exceptions import ClientError, ParamValidationError
@@ -15,6 +16,7 @@ from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 
 from api.image_url import parse_image_url
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
+from api.models.model_rules import ModelRules, Sampling, Thinking, rules_for
 from api.schema import (
     AssistantMessage,
     ChatRequest,
@@ -53,8 +55,9 @@ logger = logging.getLogger(__name__)
 
 config = Config(
     connect_timeout=60,
-    # Long enough for slow streaming responses; a stalled read is retried, so keep attempts low.
-    read_timeout=900,
+    # Below the 600 second Lambda and API Gateway limits, so a stalled call fails with
+    # a Bedrock error the gateway can report instead of the function being killed.
+    read_timeout=550,
     retries={"max_attempts": 3, "mode": "standard"},
     max_pool_connections=50,
 )
@@ -124,38 +127,6 @@ ENCODER = tiktoken.get_encoding("cl100k_base")
 # This enables feature detection for all profile types without pattern matching
 profile_metadata = {}
 
-# Models that don't support both temperature and topP simultaneously
-# When both are provided, temperature takes precedence and topP is removed
-TEMPERATURE_TOPP_CONFLICT_MODELS = {
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
-    "claude-opus-4-5",
-}
-
-# Models that reject temperature and topP outright ("`temperature` is deprecated for this model")
-# Both parameters are dropped from the request for these models
-NO_SAMPLING_PARAMS_MODELS = {
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-haiku-5",
-    "claude-fable-5",
-}
-
-# Models that only accept adaptive thinking ("thinking.type.enabled" is rejected)
-# reasoning_effort is mapped to output_config.effort instead of a budget_tokens value
-ADAPTIVE_THINKING_MODELS = NO_SAMPLING_PARAMS_MODELS
-
-# Models that reject forced tool choice ("tool_choice: type "tool" and "any" are not
-# supported"). tool_choice "required" or a named function falls back to auto for them.
-NO_FORCED_TOOL_CHOICE_MODELS = {
-    "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "claude-fable-5",
-}
-
 # Bedrock rejects Claude thinking budgets below this value
 MIN_THINKING_BUDGET_TOKENS = 1024
 
@@ -163,21 +134,6 @@ MIN_THINKING_BUDGET_TOKENS = 1024
 # so this bounds how long one request can spend downloading. Converse accepts at
 # most 20 images per request for most models anyway.
 MAX_REMOTE_IMAGES_PER_REQUEST = 20
-
-# Models that don't support assistant message prefill
-# For these models, if conversation ends with assistant message (e.g., "continue response"),
-# a user message will be added to ask the model to continue
-NO_ASSISTANT_PREFILL_MODELS = {
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-haiku-5",
-    "claude-fable-5",
-}
-
 
 def list_bedrock_models() -> dict:
     """Automatically getting a list of supported models.
@@ -289,6 +245,22 @@ def list_bedrock_models() -> dict:
 # Initialize the model list.
 bedrock_model_list: dict = {}
 bedrock_model_list = list_bedrock_models()
+_model_list_refreshed_at = time.monotonic()
+_model_list_lock = threading.Lock()
+# A model missing from the list triggers a refresh at most this often, so a model or
+# profile enabled after cold start (or a failed first listing) recovers on its own.
+MODEL_LIST_REFRESH_INTERVAL_SECONDS = 60
+
+
+def refresh_model_list(force: bool = False) -> bool:
+    """Reload the model list, at most once per interval unless forced. Returns whether it ran."""
+    global bedrock_model_list, _model_list_refreshed_at
+    with _model_list_lock:
+        if not force and time.monotonic() - _model_list_refreshed_at < MODEL_LIST_REFRESH_INTERVAL_SECONDS:
+            return False
+        bedrock_model_list = list_bedrock_models()
+        _model_list_refreshed_at = time.monotonic()
+        return True
 
 
 class BedrockModel(BaseChatModel):
@@ -299,15 +271,18 @@ class BedrockModel(BaseChatModel):
 
     def list_models(self) -> list[str]:
         """Always refresh the latest model list"""
-        global bedrock_model_list
-        bedrock_model_list = list_bedrock_models()
+        refresh_model_list(force=True)
         return list(bedrock_model_list.keys())
 
     def validate(self, chat_request: ChatRequest):
-        """Perform basic validation on requests"""
+        """Perform basic validation on requests. Blocking: may refresh the model list."""
+        if chat_request.n is not None and chat_request.n > 1:
+            raise HTTPException(status_code=400, detail="n greater than 1 is not supported")
         error = ""
         # check if model is supported
-        if chat_request.model not in bedrock_model_list.keys():
+        if chat_request.model not in bedrock_model_list and refresh_model_list():
+            logger.info("Refreshed the model list after a request for %s", chat_request.model)
+        if chat_request.model not in bedrock_model_list:
             # Provide helpful error for application profiles
             if "application-inference-profile" in chat_request.model:
                 error = (
@@ -348,40 +323,12 @@ class BedrockModel(BaseChatModel):
             return profile_metadata[model_id]["underlying_model_id"]
         return model_id
 
+    def _rules(self, model_id: str) -> ModelRules:
+        """Request rules for a model id, resolving inference profiles first."""
+        return rules_for(self._resolve_to_foundation_model(model_id))
+
     def _supports_prompt_caching(self, model_id: str) -> bool:
-        """
-        Check if model supports prompt caching based on model ID pattern.
-
-        Uses pattern matching instead of hardcoded whitelist for better maintainability.
-        Automatically supports new models following the naming convention.
-
-        Supported models:
-        - Claude: anthropic.claude-* (excluding very old versions)
-        - Nova: amazon.nova-*
-
-        Returns:
-            bool: True if model supports prompt caching
-        """
-        # Resolve profile to underlying model for feature detection
-        resolved_model = self._resolve_to_foundation_model(model_id)
-        model_lower = resolved_model.lower()
-
-        # Claude models pattern matching
-        if "anthropic.claude" in model_lower:
-            # Exclude very old models that don't support caching
-            excluded_patterns = ["claude-instant", "claude-v1", "claude-v2"]
-            if any(pattern in model_lower for pattern in excluded_patterns):
-                return False
-            return True
-
-        # Nova models pattern matching
-        if "amazon.nova" in model_lower:
-            return True
-
-        # Future providers can be added here
-        # Example: if "provider.model-name" in model_lower: return True
-
-        return False
+        return self._rules(model_id).prompt_caching
 
     async def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
@@ -401,7 +348,7 @@ class BedrockModel(BaseChatModel):
         try:
             args = await run_in_threadpool(self._parse_request, chat_request)
         except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Tool call arguments must be valid JSON: {e}")
+            raise HTTPException(status_code=400, detail=f"Tool call arguments must be valid JSON: {e}") from e
         if DEBUG:
             logger.info("Bedrock request: " + json.dumps(str(args)))
 
@@ -410,7 +357,7 @@ class BedrockModel(BaseChatModel):
                 return await run_in_threadpool(bedrock_runtime.converse_stream, **args)
             return await run_in_threadpool(bedrock_runtime.converse, **args)
         except Exception as e:
-            raise bedrock_error_to_http(e, chat_request.model)
+            raise bedrock_error_to_http(e, chat_request.model) from e
 
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
         """Default implementation for Chat API."""
@@ -546,7 +493,9 @@ class BedrockModel(BaseChatModel):
                 text = message.content
             else:
                 text = "\n".join(part.text for part in message.content)
-            system_prompts.append({"text": text})
+            # Converse rejects an empty system text block.
+            if text.strip():
+                system_prompts.append({"text": text})
 
         if not system_prompts:
             return system_prompts
@@ -593,25 +542,10 @@ class BedrockModel(BaseChatModel):
                     }
                 )
             elif isinstance(message, AssistantMessage):
-                # Check if message has content that's not empty
-                has_content = False
-                if isinstance(message.content, str):
-                    has_content = message.content.strip() != ""
-                elif isinstance(message.content, list):
-                    has_content = len(message.content) > 0
-                elif message.content is not None:
-                    has_content = True
-
-                if has_content:
-                    # Text message
-                    messages.append(
-                        {
-                            "role": message.role,
-                            "content": self._parse_content_parts(
-                                message, chat_request.model
-                            ),
-                        }
-                    )
+                # Converse rejects blank text blocks, so empty assistant text is left out.
+                content = self._parse_content_parts(message, chat_request.model) if message.content else []
+                if content:
+                    messages.append({"role": message.role, "content": content})
                 if message.tool_calls:
                     # Tool use message
                     for tool_call in message.tool_calls:
@@ -637,7 +571,7 @@ class BedrockModel(BaseChatModel):
                 # https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultBlock.html
 
                 # Handle different content formats from OpenAI SDK
-                tool_content = self._extract_tool_content(message.content)
+                tool_content = self._tool_result_content(message.content, chat_request.model)
 
                 messages.append(
                     {
@@ -646,7 +580,7 @@ class BedrockModel(BaseChatModel):
                             {
                                 "toolResult": {
                                     "toolUseId": message.tool_call_id,
-                                    "content": [{"text": tool_content}],
+                                    "content": tool_content,
                                 }
                             }
                         ],
@@ -658,56 +592,35 @@ class BedrockModel(BaseChatModel):
                 continue
         return self._reframe_multi_payloard(messages, chat_request)
 
-    def _extract_tool_content(self, content) -> str:
-        """Extract text content from various OpenAI SDK tool message formats.
+    def _tool_result_content(self, content, model_id: str) -> list[dict]:
+        """Convert OpenAI tool message content into Converse tool result blocks.
 
-        Handles:
-        - String content (legacy format)
-        - List of content objects (OpenAI SDK 1.91.0+)
-        - Nested JSON structures within text content
+        Handles a plain string, a list of text parts (OpenAI SDK 1.91.0+) and image
+        parts, which Converse accepts in tool results. Text is passed through as is.
         """
-        try:
-            if isinstance(content, str):
-                return content
+        if isinstance(content, str):
+            return [{"text": content}]
 
-            if isinstance(content, list):
-                text_parts = []
-                for i, item in enumerate(content):
-                    if isinstance(item, dict):
-                        # Handle dict with 'text' field
-                        if "text" in item:
-                            item_text = item["text"]
-                            if isinstance(item_text, str):
-                                # Try to parse as JSON if it looks like JSON
-                                if item_text.strip().startswith('{') and item_text.strip().endswith('}'):
-                                    try:
-                                        parsed_json = json.loads(item_text)
-                                        # Convert JSON object to readable text
-                                        text_parts.append(json.dumps(parsed_json, indent=2))
-                                    except json.JSONDecodeError:
-                                        # Silently fallback to original text
-                                        text_parts.append(item_text)
-                                else:
-                                    text_parts.append(item_text)
-                            else:
-                                text_parts.append(str(item_text))
-                        else:
-                            # Handle other dict formats - convert to JSON string
-                            text_parts.append(json.dumps(item, indent=2))
-                    elif hasattr(item, 'text'):
-                        # Handle ToolContent objects
-                        text_parts.append(item.text)
-                    else:
-                        # Convert any other type to string
-                        text_parts.append(str(item))
-                return "\n".join(text_parts)
-
-            # Fallback for any other type
-            return str(content)
-        except Exception as e:
-            logger.warning("Tool content extraction failed: %s", str(e))
-            # Return a safe fallback
-            return str(content) if content is not None else ""
+        blocks = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "image_url" and isinstance(item.get("image_url"), dict):
+                    if not self.is_supported_modality(model_id, modality="IMAGE"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Multimodal message is currently not supported by {model_id}",
+                        )
+                    image_data, content_type = self._parse_image(item["image_url"]["url"])
+                    blocks.append({"image": {"format": content_type[6:], "source": {"bytes": image_data}}})
+                elif isinstance(item.get("text"), str):
+                    blocks.append({"text": item["text"]})
+                else:
+                    blocks.append({"text": json.dumps(item)})
+            elif hasattr(item, "text"):
+                blocks.append({"text": item.text})
+            else:
+                blocks.append({"text": str(item)})
+        return blocks or [{"text": ""}]
 
     def _reframe_multi_payloard(self, messages: list, chat_request: ChatRequest = None) -> list:
         """Receive messages and reformat them to comply with the Claude format
@@ -767,14 +680,9 @@ class BedrockModel(BaseChatModel):
         # Bedrock Converse API requires conversations to end with a user message.
         # Some models don't support "assistant message prefill".
         # If the conversation ends with an assistant message (e.g., "continue response" scenario),
-        # add a user message asking to continue - but only for models in NO_ASSISTANT_PREFILL_MODELS.
+        # add a user message asking to continue - but only for models that reject prefill.
         if chat_request and reformatted_messages and reformatted_messages[-1]["role"] == "assistant":
-            # Resolve profile to underlying model for feature detection
-            resolved_model = self._resolve_to_foundation_model(chat_request.model)
-            model_lower = resolved_model.lower()
-
-            # Check if model is in the no-prefill list
-            if any(no_prefill_model in model_lower for no_prefill_model in NO_ASSISTANT_PREFILL_MODELS):
+            if not self._rules(chat_request.model).prefill:
                 reformatted_messages.append({
                     "role": "user",
                     "content": [{"text": "Please continue your response from where you left off."}]
@@ -842,21 +750,12 @@ class BedrockModel(BaseChatModel):
         if chat_request.top_p is not None:
             inference_config["topP"] = chat_request.top_p
 
-        # Some models (Claude Sonnet 4.5, Claude Sonnet 4.6, Haiku 4.5) don't support both temperature and topP
-        # When both are provided, keep temperature and remove topP
-        # Resolve profile to underlying model for feature detection
-        resolved_model = self._resolve_to_foundation_model(chat_request.model)
-        model_lower = resolved_model.lower()
-
-        # Check if model is in the conflict list and both parameters are present
-        if "temperature" in inference_config and "topP" in inference_config:
-            if any(conflict_model in model_lower for conflict_model in TEMPERATURE_TOPP_CONFLICT_MODELS):
-                inference_config.pop("topP", None)
-                if DEBUG:
-                    logger.info(f"Removed topP for {chat_request.model} (conflicts with temperature)")
-
-        if any(model in model_lower for model in NO_SAMPLING_PARAMS_MODELS):
+        rules = self._rules(chat_request.model)
+        if rules.sampling is Sampling.NONE:
             inference_config.pop("temperature", None)
+            inference_config.pop("topP", None)
+        elif rules.sampling is Sampling.ONE and "temperature" in inference_config:
+            # Both together are rejected; temperature takes precedence.
             inference_config.pop("topP", None)
 
         if chat_request.stop is not None:
@@ -864,6 +763,13 @@ class BedrockModel(BaseChatModel):
             if isinstance(stop, str):
                 stop = [stop]
             inference_config["stopSequences"] = stop
+
+        if chat_request.response_format and chat_request.response_format.get("type") not in (None, "text"):
+            logger.warning(
+                "response_format %s is not supported and is ignored for %s",
+                chat_request.response_format.get("type"),
+                chat_request.model,
+            )
 
         args = {
             "modelId": chat_request.model,
@@ -874,15 +780,13 @@ class BedrockModel(BaseChatModel):
         if chat_request.reasoning_effort:
             # reasoning_effort is supported by Claude and DeepSeek v3
             # Different models use different formats
-            if "anthropic.claude" in model_lower and any(
-                model in model_lower for model in ADAPTIVE_THINKING_MODELS
-            ):
+            if rules.thinking is Thinking.ADAPTIVE:
                 # Newer Claude models: adaptive thinking, depth controlled by effort
                 args["additionalModelRequestFields"] = {
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": chat_request.reasoning_effort},
                 }
-            elif "anthropic.claude" in model_lower:
+            elif rules.thinking is Thinking.BUDGET:
                 # Claude format: reasoning_config = object with budget_tokens
                 if effective_max_tokens is None:
                     raise HTTPException(
@@ -905,7 +809,7 @@ class BedrockModel(BaseChatModel):
                 args["additionalModelRequestFields"] = {
                     "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
                 }
-            elif "deepseek.v3" in model_lower or "deepseek.deepseek-v3" in model_lower:
+            elif rules.thinking is Thinking.EFFORT_STRING:
                 # DeepSeek v3 format: reasoning_config = string ('low', 'medium', 'high')
                 # From Bedrock Playground: {"reasoning_config": "high"}
                 args["additionalModelRequestFields"] = {
@@ -924,12 +828,8 @@ class BedrockModel(BaseChatModel):
         if chat_request.tools and not skip_tools:
             tool_config = {"tools": [self._convert_tool_spec(t.function) for t in chat_request.tools]}
 
-            # Llama 3.1 rejects toolChoice; "none" cannot be expressed, so it falls back to auto.
-            if (
-                chat_request.tool_choice
-                and chat_request.tool_choice != "none"
-                and "meta.llama3-1-" not in model_lower
-            ):
+            # Some models reject toolChoice; "none" cannot be expressed, so it falls back to auto.
+            if chat_request.tool_choice and chat_request.tool_choice != "none" and rules.tool_choice:
                 if isinstance(chat_request.tool_choice, str):
                     # auto (default) is mapped to {"auto" : {}}
                     # required is mapped to {"any" : {}}
@@ -947,7 +847,7 @@ class BedrockModel(BaseChatModel):
                     tool_config["toolChoice"] = {"tool": {"name": chat_request.tool_choice["function"].get("name", "")}}
 
                 forced = "any" in tool_config["toolChoice"] or "tool" in tool_config["toolChoice"]
-                if forced and any(model in model_lower for model in NO_FORCED_TOOL_CHOICE_MODELS):
+                if forced and not rules.forced_tool_choice:
                     logger.warning("%s does not support forced tool choice, using auto", chat_request.model)
                     tool_config["toolChoice"] = {"auto": {}}
             args["toolConfig"] = tool_config
@@ -1264,19 +1164,15 @@ class BedrockModel(BaseChatModel):
         model_id: str,
     ) -> list[dict]:
         if isinstance(message.content, str):
-            return [
-                {
-                    "text": message.content,
-                }
-            ]
+            if not message.content.strip() and isinstance(message, AssistantMessage):
+                return []
+            return [{"text": message.content}]
         content_parts = []
         for part in message.content:
             if isinstance(part, TextContent):
-                content_parts.append(
-                    {
-                        "text": part.text,
-                    }
-                )
+                # Converse rejects blank text blocks.
+                if part.text.strip():
+                    content_parts.append({"text": part.text})
             elif isinstance(part, ImageContent):
                 if not self.is_supported_modality(model_id, modality="IMAGE"):
                     raise HTTPException(
@@ -1348,10 +1244,19 @@ class BedrockModel(BaseChatModel):
                 "stop_sequence": "stop",
                 "complete": "stop",
                 "content_filtered": "content_filter",
+                "guardrail_intervened": "content_filter",
+                "model_context_window_exceeded": "length",
+                # Not in the OpenAI set; the closest match is a normal stop.
+                "malformed_model_output": "stop",
+                "malformed_tool_use": "stop",
             }
-            return finish_reason_mapping.get(
-                finish_reason.lower(), finish_reason.lower()
-            )
+            reason = finish_reason.lower()
+            if reason not in finish_reason_mapping:
+                # Strict OpenAI clients reject values outside their enum.
+                logger.warning("Unknown Bedrock stop reason %s reported as stop", finish_reason)
+            elif reason.startswith("malformed_"):
+                logger.warning("Bedrock stopped with %s", finish_reason)
+            return finish_reason_mapping.get(reason, "stop")
         return None
 
 
@@ -1407,7 +1312,7 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
                 contentType=self.content_type,
             )
         except Exception as e:
-            raise bedrock_error_to_http(e, model_id)
+            raise bedrock_error_to_http(e, model_id) from e
 
     def _create_response(
         self,
@@ -1420,9 +1325,8 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
         data = []
         for i, embedding in enumerate(embeddings):
             if encoding_format == "base64":
-                arr = np.array(embedding, dtype=np.float32)
-                arr_bytes = arr.tobytes()
-                encoded_embedding = base64.b64encode(arr_bytes)
+                # Little-endian float32, the layout OpenAI clients decode.
+                encoded_embedding = base64.b64encode(struct.pack(f"<{len(embedding)}f", *embedding))
                 data.append(Embedding(index=i, embedding=encoded_embedding))
             else:
                 data.append(Embedding(index=i, embedding=embedding))

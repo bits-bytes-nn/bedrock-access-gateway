@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from api.auth import api_key_auth
 from api.models.bedrock import BedrockModel
@@ -24,7 +25,7 @@ async def chat_completions(
         Body(
             examples=[
                 {
-                    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+                    "model": "global.anthropic.claude-opus-5-5",
                     "messages": [
                         {"role": "system", "content": "You are a helpful assistant."},
                         {"role": "user", "content": "Hello!"},
@@ -39,7 +40,8 @@ async def chat_completions(
 
     # Exception will be raised if model not supported.
     model = BedrockModel()
-    model.validate(chat_request)
+    # May refresh the model list with blocking boto3 calls.
+    await run_in_threadpool(model.validate, chat_request)
     if chat_request.stream:
         # Awaiting first lets request errors return a status code before the stream starts.
         return StreamingResponse(content=await model.chat_stream(chat_request), media_type="text/event-stream")

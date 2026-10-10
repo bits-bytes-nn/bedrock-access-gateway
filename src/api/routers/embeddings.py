@@ -21,7 +21,7 @@ async def embeddings(
         Body(
             examples=[
                 {
-                    "model": "cohere.embed-multilingual-v3",
+                    "model": "amazon.titan-embed-text-v2:0",
                     "input": ["Your text string goes here"],
                 }
             ],

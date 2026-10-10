@@ -21,10 +21,11 @@ elif api_key_secret_arn:
     try:
         response = sm.get_secret_value(SecretId=api_key_secret_arn)
         api_key = json.loads(response["SecretString"])["api_key"]
-    except ClientError:
-        raise RuntimeError("Unable to retrieve API KEY, please ensure the secret ARN is correct")
+    except ClientError as e:
+        raise RuntimeError("Unable to retrieve API KEY, please ensure the secret ARN is correct") from e
     except (KeyError, TypeError, json.JSONDecodeError):
-        raise RuntimeError('Please ensure the secret is a JSON string with an "api_key" field')
+        # The secret value itself is deliberately not chained into the traceback.
+        raise RuntimeError('Please ensure the secret is a JSON string with an "api_key" field') from None
 elif api_key_env:
     api_key = api_key_env
 else:

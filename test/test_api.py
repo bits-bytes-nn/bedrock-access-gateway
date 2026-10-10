@@ -385,3 +385,320 @@ def test_cohere_v4_through_an_inference_profile(client, runtime):
     response = embed(client, model="global.cohere.embed-v4:0", input=["a", "b"], dimensions=256)
     assert response.status_code == 200
     assert [len(item["embedding"]) for item in response.json()["data"]] == [256, 256]
+
+
+# --- model list -----------------------------------------------------------------------
+
+
+def test_missing_model_triggers_one_rate_limited_refresh(client, runtime, monkeypatch):
+    calls = []
+
+    def listing():
+        calls.append(1)
+        return {CHAT_MODEL: {"modalities": ["TEXT"]}, "global.anthropic.claude-opus-6": {"modalities": ["TEXT"]}}
+
+    monkeypatch.setattr(bedrock_module, "list_bedrock_models", listing)
+    monkeypatch.setattr(bedrock_module, "_model_list_refreshed_at", -1e9)
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+
+    assert chat(client, model="global.anthropic.claude-opus-6").status_code == 200
+    # A second unknown model within the interval does not hit Bedrock again.
+    assert chat(client, model="no-such-model").status_code == 400
+    assert len(calls) == 1
+
+
+def test_model_discovery_maps_profiles_to_models(monkeypatch):
+    fake = bedrock_module.bedrock_client.__class__()
+    profiles = {
+        "SYSTEM_DEFINED": [
+            {"inferenceProfileId": "global.anthropic.claude-opus-5-5", "models": [{"modelArn": "arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5"}]}
+        ],
+        "APPLICATION": [
+            {
+                "inferenceProfileArn": "arn:aws:bedrock:ap-northeast-2:123456789012:application-inference-profile/app",
+                "models": [{"modelArn": "arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5"}],
+            }
+        ],
+    }
+    fake.get_paginator.return_value.paginate.side_effect = lambda typeEquals, **_: [
+        {"inferenceProfileSummaries": profiles[typeEquals]}
+    ]
+
+    def model(model_id, status="ACTIVE", streaming=True, inference=("ON_DEMAND",)):
+        return {
+            "modelId": model_id,
+            "responseStreamingSupported": streaming,
+            "modelLifecycle": {"status": status},
+            "inferenceTypesSupported": list(inference),
+            "inputModalities": ["TEXT", "IMAGE"],
+        }
+
+    fake.list_foundation_models.return_value = {
+        "modelSummaries": [
+            model("anthropic.claude-opus-5-5", inference=("INFERENCE_PROFILE",)),
+            model("amazon.nova-pro-v1:0"),
+            model("anthropic.claude-v2", status="RETIRED"),
+            model("cohere.rerank-v3-5:0", streaming=False),
+        ]
+    }
+    monkeypatch.setattr(bedrock_module, "bedrock_client", fake)
+    monkeypatch.setattr(bedrock_module, "profile_metadata", {})
+
+    models = bedrock_module.list_bedrock_models()
+
+    assert sorted(models) == [
+        "amazon.nova-pro-v1:0",
+        "arn:aws:bedrock:ap-northeast-2:123456789012:application-inference-profile/app",
+        "global.anthropic.claude-opus-5-5",
+    ]
+    assert bedrock_module.profile_metadata["global.anthropic.claude-opus-5-5"]["underlying_model_id"] == (
+        "anthropic.claude-opus-5-5"
+    )
+
+
+def test_openai_model_names_use_the_defaults(client, runtime, monkeypatch):
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, DEFAULT_MODEL, {"modalities": ["TEXT"]})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    assert chat(client, model="gpt-4o").status_code == 200
+    assert sent_args(runtime)["modelId"] == DEFAULT_MODEL
+
+    runtime.invoke_model.side_effect = titan_response
+    assert embed(client, model="text-embedding-3-small", input="a").json()["model"] == setting.DEFAULT_EMBEDDING_MODEL
+
+
+def test_n_greater_than_one_is_rejected(client, runtime):
+    assert chat(client, n=2).status_code == 400
+
+
+# --- prompt caching ----------------------------------------------------------------
+
+SYSTEM_AND_USER = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+
+
+def cache_points(args):
+    system = [block for block in args["system"] if "cachePoint" in block]
+    messages = [block for message in args["messages"] for block in message["content"] if "cachePoint" in block]
+    return len(system), len(messages)
+
+
+@pytest.mark.parametrize(
+    "model,enabled,extra_body,expected",
+    [
+        (CHAT_MODEL, True, None, (1, 1)),
+        (CHAT_MODEL, False, None, (0, 0)),
+        (CHAT_MODEL, False, {"prompt_caching": {"system": True}}, (1, 0)),
+        (CHAT_MODEL, True, {"prompt_caching": {"messages": False}}, (1, 0)),
+        # Claude 3 Haiku rejects cache points, so none are added even when enabled.
+        ("apac.anthropic.claude-3-haiku-20240307-v1:0", True, None, (0, 0)),
+    ],
+)
+def test_cache_points_follow_settings_and_model_support(client, runtime, monkeypatch, model, enabled, extra_body, expected):
+    monkeypatch.setattr(bedrock_module, "ENABLE_PROMPT_CACHING", enabled)
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, model, {"modalities": ["TEXT"]})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    assert chat(client, model=model, messages=SYSTEM_AND_USER, extra_body=extra_body).status_code == 200
+    assert cache_points(sent_args(runtime)) == expected
+
+
+# --- message conversion ------------------------------------------------------------
+
+
+def test_empty_text_blocks_are_left_out(client, runtime):
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": [{"type": "text", "text": ""}, {"type": "text", "text": "again"}]},
+    ]
+    assert chat(client, messages=messages).status_code == 200
+    args = sent_args(runtime)
+    assert args["system"] == []
+    assert [m["role"] for m in args["messages"]] == ["user"]
+    assert args["messages"][0]["content"] == [{"text": "hi"}, {"text": "again"}]
+
+
+PNG = "data:image/png;base64,iVBORw0KGgo="
+
+
+def test_tool_results_keep_text_and_images(client, runtime):
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    messages = [
+        {"role": "user", "content": "look"},
+        {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {
+            "role": "tool",
+            "tool_call_id": "t1",
+            "content": [{"type": "text", "text": '{"a": 1}'}, {"type": "image_url", "image_url": {"url": PNG}}],
+        },
+    ]
+    assert chat(client, messages=messages, tools=[TOOL]).status_code == 200
+    result = sent_args(runtime)["messages"][-1]["content"][0]["toolResult"]["content"]
+    assert result[0] == {"text": '{"a": 1}'}
+    assert result[1]["image"]["format"] == "png"
+
+
+def test_images_in_chat_are_sent_as_image_blocks(client, runtime, monkeypatch):
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    content = [{"type": "text", "text": "what?"}, {"type": "image_url", "image_url": {"url": PNG}}]
+    assert chat(client, messages=[{"role": "user", "content": content}]).status_code == 200
+    assert sent_args(runtime)["messages"][0]["content"][1]["image"]["format"] == "png"
+
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, CHAT_MODEL, {"modalities": ["TEXT"]})
+    assert chat(client, messages=[{"role": "user", "content": content}]).status_code == 400
+
+
+# --- responses: usage, finish reasons, errors ---------------------------------------
+
+
+def test_usage_counts_cached_tokens(client, runtime):
+    result = converse_result([{"text": "ok"}])
+    result["usage"] = {"inputTokens": 3, "outputTokens": 2, "totalTokens": 25, "cacheReadInputTokens": 20}
+    runtime.converse.return_value = result
+    usage = chat(client).json()["usage"]
+    assert (usage["prompt_tokens"], usage["completion_tokens"], usage["prompt_tokens_details"]["cached_tokens"]) == (23, 2, 20)
+
+
+@pytest.mark.parametrize("stream_options,expect_usage", [({"include_usage": True}, True), ({}, False), (None, False)])
+def test_stream_usage_chunk_only_when_requested(client, runtime, stream_options, expect_usage):
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "ok"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4}}},
+    ]
+    runtime.converse_stream.return_value = {"stream": iter(events)}
+    body = {"stream": True} if stream_options is None else {"stream": True, "stream_options": stream_options}
+    lines = [line for line in chat(client, **body).text.splitlines() if line.startswith("data: {")]
+    usage_chunks = [json.loads(line[6:]) for line in lines if json.loads(line[6:])["choices"] == []]
+    assert bool(usage_chunks) is expect_usage
+
+
+@pytest.mark.parametrize(
+    "stop_reason,expected",
+    [
+        ("end_turn", "stop"),
+        ("max_tokens", "length"),
+        ("tool_use", "tool_calls"),
+        ("guardrail_intervened", "content_filter"),
+        ("model_context_window_exceeded", "length"),
+        ("malformed_tool_use", "stop"),
+        ("something_new", "stop"),
+    ],
+)
+def test_finish_reasons_stay_within_the_openai_set(client, runtime, stop_reason, expected):
+    runtime.converse.return_value = converse_result([{"text": "ok"}], stop_reason=stop_reason)
+    assert chat(client).json()["choices"][0]["finish_reason"] == expected
+
+
+@pytest.mark.parametrize(
+    "code,status,exposed",
+    [
+        ("ValidationException", 400, True),
+        ("ResourceNotFoundException", 404, True),
+        ("ThrottlingException", 429, True),
+        ("ServiceQuotaExceededException", 429, True),
+        ("AccessDeniedException", 403, False),
+        ("ModelNotReadyException", 503, False),
+        ("ServiceUnavailableException", 503, False),
+        ("ModelTimeoutException", 504, False),
+        ("ModelErrorException", 502, False),
+        ("InternalServerException", 500, False),
+    ],
+)
+def test_bedrock_error_codes_map_to_statuses(client, runtime, code, status, exposed):
+    runtime.converse.side_effect = client_error(code, "detail-from-bedrock")
+    response = chat(client)
+    assert response.status_code == status
+    assert ("detail-from-bedrock" in response.text) is exposed
+
+
+def test_unexpected_errors_are_a_generic_500(client, runtime):
+    runtime.converse.side_effect = RuntimeError("internal detail")
+    response = chat(client)
+    assert response.status_code == 500
+    assert "internal detail" not in response.text
+
+
+# --- embeddings: encoding and Nova -------------------------------------------------
+
+
+def test_base64_embeddings_decode_to_float32(client, runtime):
+    import base64
+    import struct
+
+    runtime.invoke_model.side_effect = titan_response
+    item = embed(client, model=TITAN_V2, input="a", encoding_format="base64").json()["data"][0]
+    assert struct.unpack("<2f", base64.b64decode(item["embedding"])) == pytest.approx((0.1, 0.2))
+
+
+def test_nova_embeddings_use_the_requested_dimension(client, runtime):
+    def nova_response(body, **_kwargs):
+        dimension = json.loads(body)["singleEmbeddingParams"]["embeddingDimension"]
+        return invoke_result({"embeddings": [{"embeddingType": "TEXT", "embedding": [0.0] * dimension}]})
+
+    runtime.invoke_model.side_effect = nova_response
+    model = "amazon.nova-2-multimodal-embeddings-v1:0"
+    assert len(embed(client, model=model, input="a", dimensions=256).json()["data"][0]["embedding"]) == 256
+    assert embed(client, model=model, input="a", dimensions=300).status_code == 400
+
+
+def test_unknown_embedding_model_is_rejected(client, runtime):
+    assert embed(client, model="no-such-embedder", input="a").status_code == 400
+
+
+# --- OpenAI SDK contract -------------------------------------------------------------
+
+
+def test_responses_parse_as_openai_sdk_models(client, runtime):
+    from openai.types import CreateEmbeddingResponse
+    from openai.types.chat import ChatCompletion, ChatCompletionChunk
+
+    runtime.converse.return_value = converse_result(
+        [{"text": "ok"}, {"toolUse": {"toolUseId": "t1", "name": "get_time", "input": {}}}], stop_reason="tool_use"
+    )
+    ChatCompletion.model_validate(chat(client, tools=[TOOL]).json())
+
+    for chunk in stream_chunks(
+        client,
+        runtime,
+        [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "ok"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ],
+    ):
+        ChatCompletionChunk.model_validate(chunk)
+
+    runtime.invoke_model.side_effect = titan_response
+    CreateEmbeddingResponse.model_validate(embed(client, model=TITAN_V2, input=["a", "b"]).json())
+
+
+# --- auth --------------------------------------------------------------------------
+
+
+def test_api_key_is_read_from_secrets_manager(monkeypatch):
+    import importlib
+
+    import boto3
+
+    from api import auth
+
+    secrets = boto3.client("secretsmanager")
+    secrets.get_secret_value.return_value = {"SecretString": json.dumps({"api_key": "from-secret"})}
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: secrets)
+    monkeypatch.setenv("API_KEY_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123456789012:secret:key")
+    try:
+        assert importlib.reload(auth).api_key == "from-secret"
+
+        secrets.get_secret_value.return_value = {"SecretString": "not json"}
+        with pytest.raises(RuntimeError, match="api_key"):
+            importlib.reload(auth)
+    finally:
+        monkeypatch.delenv("API_KEY_SECRET_ARN")
+        importlib.reload(auth)
+
+
+def test_missing_authorization_header_is_rejected(client):
+    assert client.get("/api/v1/models").status_code in (401, 403)

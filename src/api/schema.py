@@ -93,7 +93,8 @@ class Tool(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    include_usage: bool = True
+    # Off unless requested, as in the OpenAI API.
+    include_usage: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -109,7 +110,8 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     reasoning_effort: Literal["low", "medium", "high"] | None = None
-    n: int | None = 1  # Not used
+    n: int | None = Field(default=1, ge=1)  # Only 1 is supported
+    response_format: dict | None = None  # Not supported; logged and ignored
     tools: list[Tool] | None = None
     tool_choice: str | object = "auto"
     stop: list[str] | str | None = None

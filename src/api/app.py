@@ -6,7 +6,6 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from mangum import Mangum
 
 from api.routers import chat, embeddings, model
 from api.setting import API_ROUTE_PREFIX, DESCRIPTION, SUMMARY, TITLE, VERSION
@@ -65,8 +64,6 @@ async def validation_exception_handler(request, exc):
     return JSONResponse({"detail": detail or "Invalid request"}, status_code=400)
 
 
-handler = Mangum(app)
-
 if __name__ == "__main__":
-    # Bind to 0.0.0.0 for container environments, network is handled by network policies and load balancers
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)  # nosec B104
+    # Run from src/: python -m api.app. Bind to 0.0.0.0 for container environments.
+    uvicorn.run("api.app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))  # nosec B104

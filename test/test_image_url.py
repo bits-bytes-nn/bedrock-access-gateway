@@ -377,8 +377,11 @@ def test_ipv6_transition_forms_of_internal_addresses_are_blocked(address, monkey
 def test_slow_download_is_cut_off_at_the_deadline(resolve_to_public, capture_request, monkeypatch):
     _calls, responses = capture_request
     responses.append(FakeResponse(headers={"Content-Type": "image/png"}, body=b"x" * (3 * 64 * 1024)))
-    clock = iter([0.0, 1.0, image_url_module.TOTAL_TIMEOUT_SECONDS + 1.0, 10_000.0])
-    monkeypatch.setattr(image_url_module.time, "monotonic", lambda: next(clock))
+    # Start, before connecting, then past the deadline from the first chunk on.
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(
+        image_url_module, "_monotonic", lambda: next(ticks, image_url_module.TOTAL_TIMEOUT_SECONDS + 1.0)
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         parse_image_url("https://example.com/slow.png")
@@ -444,10 +447,20 @@ def test_open_connects_to_the_pinned_address_with_the_original_host(loopback_ser
     assert _Handler.seen_hosts == [f"images.example.com:{port}"]
 
 
-def test_open_falls_back_to_the_next_address(loopback_server):
+def test_open_falls_back_to_the_next_address(loopback_server, monkeypatch):
     port = loopback_server.server_address[1]
-    # 127.0.0.2 refuses the connection on macOS and Linux CI alike, as nothing listens there on this port.
-    response = image_url_module._open(_target(port, ips=("127.0.0.2", "127.0.0.1")), read_timeout=2)
+    attempted = []
+    real_new_conn = image_url_module._HTTPConnection._new_conn
+
+    def refuse_first_address(conn):
+        attempted.append(conn.host)
+        if conn.host == "192.0.2.1":
+            raise image_url_module.NewConnectionError(conn, "refused")
+        return real_new_conn(conn)
+
+    monkeypatch.setattr(image_url_module._HTTPConnection, "_new_conn", refuse_first_address)
+    response = image_url_module._open(_target(port, ips=("192.0.2.1", "127.0.0.1")), read_timeout=2)
+    assert attempted == ["192.0.2.1", "127.0.0.1"]
     assert response.read() == b"png-bytes"
     response.release_conn()
 

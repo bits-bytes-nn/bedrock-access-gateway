@@ -65,6 +65,9 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 # Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ImageBlock.html
 SUPPORTED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 DEFAULT_IMAGE_TYPE = "image/jpeg"
+# Clock used for fetch deadlines; replaced in tests.
+_monotonic = time.monotonic
+
 # Content types that name a supported format under a different label.
 IMAGE_TYPE_ALIASES = {"image/jpg": "image/jpeg"}
 
@@ -131,7 +134,7 @@ def _resolved_addresses(host: str, port: int) -> list[ipaddress.IPv4Address | ip
         addr_infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, UnicodeError):
         logger.warning("Unable to resolve image url host")
-        raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+        raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL) from None
 
     return [ipaddress.ip_address(addr_info[4][0]) for addr_info in addr_infos]
 
@@ -157,7 +160,7 @@ def _validate_url(url: str) -> _Target:
     try:
         parsed = parse_url(url)
     except LocationParseError:
-        raise HTTPException(status_code=400, detail="Image url is not valid")
+        raise HTTPException(status_code=400, detail="Image url is not valid") from None
 
     scheme = (parsed.scheme or "").lower()
     if scheme not in ALLOWED_SCHEMES:
@@ -320,11 +323,11 @@ def _read_capped(response: urllib3.BaseHTTPResponse, max_bytes: int, deadline: f
                 status_code=413,
                 detail=f"Image exceeds the maximum size of {IMAGE_URL_MAX_SIZE_MB} MB",
             )
-        if time.monotonic() > deadline:
+        if _monotonic() > deadline:
             break
     # Checked after the loop as well: when the deadline shuts the socket down, a body
     # without Content-Length simply ends early and must not be returned as complete.
-    if time.monotonic() > deadline:
+    if _monotonic() > deadline:
         logger.warning("Image url download exceeded %s seconds", TOTAL_TIMEOUT_SECONDS)
         raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
     return bytes(content)
@@ -344,7 +347,7 @@ def parse_image_url(image_url: str) -> tuple[bytes, str]:
         try:
             image_data = base64.b64decode(payload, validate=True)
         except (binascii.Error, ValueError):
-            raise HTTPException(status_code=400, detail="Image data url is not valid base64")
+            raise HTTPException(status_code=400, detail="Image data url is not valid base64") from None
         return image_data, normalize_image_content_type(match.group(1))
 
     return _fetch_image(image_url)
@@ -359,19 +362,19 @@ def _fetch_image(image_url: str) -> tuple[bytes, str]:
         )
 
     max_bytes = IMAGE_URL_MAX_SIZE_MB * 1024 * 1024
-    deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    deadline = _monotonic() + TOTAL_TIMEOUT_SECONDS
     with _Deadline(TOTAL_TIMEOUT_SECONDS):
         url = image_url
         for _ in range(MAX_REDIRECTS + 1):
             target = _validate_url(url)
-            remaining = deadline - time.monotonic()
+            remaining = deadline - _monotonic()
             if remaining <= 0:
                 raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
             try:
                 response = _open(target, read_timeout=min(READ_TIMEOUT_SECONDS, remaining))
             except (HTTPError, OSError):
                 logger.warning("Image url request failed", exc_info=True)
-                raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+                raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL) from None
 
             try:
                 if response.status in REDIRECT_STATUSES:
@@ -390,7 +393,7 @@ def _fetch_image(image_url: str) -> tuple[bytes, str]:
                     return _read_capped(response, max_bytes, deadline), content_type
                 except (HTTPError, OSError):
                     logger.warning("Image url download failed", exc_info=True)
-                    raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL)
+                    raise HTTPException(status_code=400, detail=_UNREACHABLE_DETAIL) from None
             finally:
                 response.release_conn()
 
