@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # NOTE: The script will try to create the ECR repository if it doesn't exist. Please grant the necessary permissions to the IAM user or role.
 # Usage:
 #    cd scripts
@@ -17,19 +18,19 @@ echo "================================================"
 echo ""
 
 # Get repository name for Lambda version
-read -p "Enter ECR repository name for Lambda (default: bedrock-proxy-api): " LAMBDA_REPO
+read -r -p "Enter ECR repository name for Lambda (default: bedrock-proxy-api): " LAMBDA_REPO
 LAMBDA_REPO=${LAMBDA_REPO:-bedrock-proxy-api}
 
 # Get repository name for ECS/Fargate version
-read -p "Enter ECR repository name for ECS/Fargate (default: bedrock-proxy-api-ecs): " ECS_REPO
+read -r -p "Enter ECR repository name for ECS/Fargate (default: bedrock-proxy-api-ecs): " ECS_REPO
 ECS_REPO=${ECS_REPO:-bedrock-proxy-api-ecs}
 
 # Get image tag
-read -p "Enter image tag (default: latest): " TAG
+read -r -p "Enter image tag (default: latest): " TAG
 TAG=${TAG:-latest}
 
 # Get AWS region
-read -p "Enter AWS region (default: us-east-1): " AWS_REGION
+read -r -p "Enter AWS region (default: us-east-1): " AWS_REGION
 AWS_REGION=${AWS_REGION:-us-east-1}
 
 echo ""
@@ -39,7 +40,7 @@ echo "  ECS/Fargate Repository: $ECS_REPO"
 echo "  Image Tag: $TAG"
 echo "  AWS Region: $AWS_REGION"
 echo ""
-read -p "Continue with these settings? (y/n): " CONFIRM
+read -r -p "Continue with these settings? (y/n): " CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo "Aborted."
     exit 1
@@ -58,7 +59,7 @@ echo "   Required IAM permissions: ecr:CreateRepository, ecr:GetAuthorizationTok
 echo "   ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,"
 echo "   ecr:CompleteLayerUpload, ecr:PutImage"
 echo ""
-read -p "Do you acknowledge and want to proceed? (y/n): " ACK_CONFIRM
+read -r -p "Do you acknowledge and want to proceed? (y/n): " ACK_CONFIRM
 if [[ ! "$ACK_CONFIRM" =~ ^[Yy]$ ]]; then
     echo "Aborted."
     exit 1
@@ -84,34 +85,36 @@ build_and_push_image() {
     # Lambda requires Docker V2 Schema 2 format without multi-manifest index.
     # See: https://github.com/aws-samples/bedrock-access-gateway/issues/206
     docker buildx build \
-        --platform linux/$ARCH \
+        --platform "linux/$ARCH" \
         --provenance=false \
         --sbom=false \
-        -t $IMAGE_NAME:$TAG \
-        -f $DOCKERFILE_PATH \
+        -t "$IMAGE_NAME:$TAG" \
+        -f "$DOCKERFILE_PATH" \
         --load \
         ../src/
 
     # Get the account ID
-    ACCOUNT_ID=$(aws sts get-caller-identity --region $REGION --query Account --output text)
+    ACCOUNT_ID=$(aws sts get-caller-identity --region "$REGION" --query Account --output text)
 
     # Create repository URI
     REPOSITORY_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${IMAGE_NAME}"
 
     echo "Creating ECR repository if it doesn't exist..."
     # Create ECR repository if it doesn't exist
-    aws ecr create-repository --repository-name "${IMAGE_NAME}" --region $REGION || true
+    if ! aws ecr describe-repositories --repository-names "${IMAGE_NAME}" --region "$REGION" >/dev/null 2>&1; then
+        aws ecr create-repository --repository-name "${IMAGE_NAME}" --region "$REGION" >/dev/null
+    fi
 
     echo "Logging in to ECR..."
     # Log in to ECR
-    aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+    aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REPOSITORY_URI"
 
     echo "Pushing image to ECR..."
     # Tag the image for ECR
-    docker tag $IMAGE_NAME:$TAG $REPOSITORY_URI:$TAG
+    docker tag "$IMAGE_NAME:$TAG" "$REPOSITORY_URI:$TAG"
 
     # Push the image to ECR
-    docker push $REPOSITORY_URI:$TAG
+    docker push "$REPOSITORY_URI:$TAG"
 
     echo "✅ Successfully pushed $IMAGE_NAME:$TAG to $REPOSITORY_URI"
     echo ""
@@ -128,7 +131,7 @@ echo "✅ All images successfully pushed!"
 echo "================================================"
 echo ""
 echo "Your container image URIs:"
-ACCOUNT_ID=$(aws sts get-caller-identity --region $AWS_REGION --query Account --output text)
+ACCOUNT_ID=$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)
 echo "  Lambda: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${LAMBDA_REPO}:${TAG}"
 echo "  ECS/Fargate: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECS_REPO}:${TAG}"
 echo ""

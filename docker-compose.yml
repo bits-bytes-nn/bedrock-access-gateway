@@ -1,5 +1,4 @@
-version: '3.8'
-
+# Local run with your AWS credentials: OPENAI_API_KEY=<key> AWS_REGION=<region> docker compose up
 services:
   bedrock-access-gateway:
     build:
@@ -10,9 +9,11 @@ services:
     environment:
       - ENABLE_PROMPT_CACHING=true
       - API_KEY=${OPENAI_API_KEY}
+      - AWS_REGION
       - AWS_PROFILE
       - AWS_ACCESS_KEY_ID
       - AWS_SECRET_ACCESS_KEY
       - AWS_SESSION_TOKEN
     volumes:
-      - ${HOME}/.aws:/home/appuser/.aws
+      # Read-only, but SSO token refreshes need a writable cache; prefer exported credentials then.
+      - ${HOME}/.aws:/home/appuser/.aws:ro

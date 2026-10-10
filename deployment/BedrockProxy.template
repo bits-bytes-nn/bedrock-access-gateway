@@ -2,8 +2,9 @@ Description: Bedrock Access Gateway - OpenAI-compatible RESTful APIs for Amazon 
 Parameters:
   ApiKeySecretArn:
     Type: String
-    AllowedPattern: ^arn:aws:secretsmanager:.*$
-    Description: The secret ARN in Secrets Manager used to store the API Key
+    # The full ARN, with the random suffix: the IAM policy below must match it exactly.
+    AllowedPattern: ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+-[A-Za-z0-9]{6}$
+    Description: The full ARN (including the 6-character suffix) of the Secrets Manager secret that stores the API Key
   ContainerImageUri:
     Type: String
     Description: The ECR image URI for the Lambda function. Use a digest (repo@sha256:...) or a unique tag; an unchanged URI does not redeploy the function.
@@ -38,6 +39,16 @@ Parameters:
       - "true"
       - "false"
     Description: Enable prompt caching for supported models (Claude, Nova). When enabled, adds cachePoint to system prompts and messages for cost savings.
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Steady-state requests per second the API accepts. Bounds the Bedrock spend if the API key leaks.
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Requests the API accepts in a burst above the steady-state rate.
 Resources:
   # IAM Role for Lambda
   ProxyApiHandlerServiceRole:
@@ -122,7 +133,6 @@ Resources:
       Timeout: 600
     DependsOn:
       - ProxyApiHandlerServiceRoleDefaultPolicy
-      - ProxyApiHandlerServiceRole
 
   # API Gateway REST API (Regional)
   RestApi:
@@ -150,7 +160,7 @@ Resources:
               x-amazon-apigateway-integration:
                 type: aws_proxy
                 httpMethod: POST
-                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyApiHandler.Arn}/response-streaming-invocations"
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyApiHandler.Arn}/response-streaming-invocations"
                 passthroughBehavior: when_no_match
                 timeoutInMillis: 600000
                 responseTransferMode: STREAM
@@ -162,7 +172,7 @@ Resources:
               x-amazon-apigateway-integration:
                 type: aws_proxy
                 httpMethod: POST
-                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyApiHandler.Arn}/response-streaming-invocations"
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyApiHandler.Arn}/response-streaming-invocations"
                 passthroughBehavior: when_no_match
                 timeoutInMillis: 600000
                 responseTransferMode: STREAM
@@ -177,15 +187,14 @@ Resources:
       FunctionName: !Ref ProxyApiHandler
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*"
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*"
 
-  # API Gateway Deployment
+  # API Gateway Deployment. CloudFormation does not redeploy an unchanged Deployment,
+  # so after editing the RestApi Body, rename this resource to publish the change.
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
     Properties:
       RestApiId: !Ref RestApi
-    DependsOn:
-      - RestApi
 
   # API Gateway Stage
   ApiStage:
@@ -195,6 +204,11 @@ Resources:
       DeploymentId: !Ref ApiDeployment
       StageName: api
       Description: API Stage with streaming support
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref ThrottlingRateLimit
+          ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
 
 Outputs:
   APIBaseUrl:
