@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from api.models import bedrock as bedrock_module
 from api.models.bedrock import BedrockModel
-from api.schema import ChatRequest
+from api.schema import ChatRequest, Usage
 
 NEW_CLAUDE = [
     "global.anthropic.claude-opus-5-5",
@@ -20,6 +20,7 @@ OLDER_CLAUDE = [
     "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "global.anthropic.claude-opus-4-5-20251101-v1:0",
 ]
+USAGE = Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
 PREFILL = [
     {"role": "user", "content": "Count to 5"},
     {"role": "assistant", "content": "1, 2,"},
@@ -50,7 +51,7 @@ def test_temperature_kept_for_older_models(gateway, model_id):
 
 def test_sampling_params_dropped_for_application_profile(gateway, monkeypatch):
     arn = "arn:aws:bedrock:ap-northeast-2:123456789012:application-inference-profile/abc"
-    monkeypatch.setitem(bedrock_module.profile_metadata, arn, {"underlying_model_id": "anthropic.claude-opus-5-5"})
+    monkeypatch.setitem(bedrock_module.profile_models, arn, "anthropic.claude-opus-5-5")
     args = build(gateway, model=arn, max_tokens=100, temperature=0.5)
     assert "temperature" not in args["inferenceConfig"]
 
@@ -95,7 +96,7 @@ def test_prefill_kept_for_models_that_support_it(gateway, model_id):
 def test_redacted_reasoning_does_not_break_response(gateway):
     content = [{"reasoningContent": {"redactedContent": b"\x00\x01"}}, {"text": "ok"}]
     response = gateway._create_response(
-        model="global.openai.gpt-6.1-sol", message_id="id", content=content, finish_reason="end_turn"
+        model="global.openai.gpt-6.1-sol", message_id="id", content=content, finish_reason="end_turn", usage=USAGE
     )
     assert response.choices[0].message.content == "ok"
     assert response.usage.completion_tokens_details is None
@@ -104,7 +105,7 @@ def test_redacted_reasoning_does_not_break_response(gateway):
 def test_reasoning_text_still_wrapped_in_think_tags(gateway):
     content = [{"reasoningContent": {"reasoningText": {"text": "plan"}}}, {"text": "ok"}]
     response = gateway._create_response(
-        model="global.moonshotai.kimi-k3", message_id="id", content=content, finish_reason="end_turn"
+        model="global.moonshotai.kimi-k3", message_id="id", content=content, finish_reason="end_turn", usage=USAGE
     )
     assert response.choices[0].message.content == "<think>plan</think>ok"
 
@@ -112,3 +113,58 @@ def test_reasoning_text_still_wrapped_in_think_tags(gateway):
 def test_redacted_reasoning_stream_chunk_is_skipped(gateway):
     chunk = {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"reasoningContent": {"redactedContent": b"x"}}}}
     assert gateway._create_response_stream("global.openai.gpt-6.1-sol", "id", chunk) is None
+
+
+@pytest.mark.parametrize("model_id", OLDER_CLAUDE + ["anthropic.claude-3-7-sonnet-20250219-v1:0"])
+def test_budget_thinking_drops_sampling_and_forced_tool_choice(gateway, model_id):
+    # Bedrock: "`temperature` may only be set to 1 when thinking is enabled" and
+    # "Thinking may not be enabled when tool_choice forces tool use".
+    tools = [{"type": "function", "function": {"name": "get_time"}}]
+    args = build(
+        gateway,
+        model=model_id,
+        max_tokens=4000,
+        temperature=0.2,
+        reasoning_effort="high",
+        tools=tools,
+        tool_choice="required",
+    )
+    assert args["inferenceConfig"] == {"maxTokens": 4000}
+    assert args["toolConfig"]["toolChoice"] == {"auto": {}}
+
+
+def test_thinking_through_extra_body_also_drops_temperature(gateway):
+    thinking = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    args = build(gateway, model=OLDER_CLAUDE[0], max_tokens=2000, temperature=0.2, extra_body=thinking)
+    assert args["inferenceConfig"] == {"maxTokens": 2000}
+    assert args["additionalModelRequestFields"] == thinking
+
+
+def test_reasoning_effort_is_ignored_by_claude_without_thinking(gateway):
+    args = build(gateway, model="anthropic.claude-3-5-sonnet-20240620-v1:0", max_tokens=100, reasoning_effort="low")
+    assert "additionalModelRequestFields" not in args
+
+
+def test_returned_reasoning_is_not_sent_back_as_text(gateway):
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "<think>plan\nmore</think>Hello"},
+        {"role": "user", "content": "again"},
+    ]
+    sent = build(gateway, model=NEW_CLAUDE[0], max_tokens=50, messages=messages)["messages"]
+    assert sent[1]["content"] == [{"text": "Hello"}]
+
+
+def test_disabled_thinking_keeps_temperature_and_tool_choice(gateway):
+    tools = [{"type": "function", "function": {"name": "get_time"}}]
+    args = build(
+        gateway,
+        model=OLDER_CLAUDE[0],
+        max_tokens=100,
+        temperature=0.2,
+        tools=tools,
+        tool_choice="required",
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    assert args["inferenceConfig"]["temperature"] == 0.2
+    assert args["toolConfig"]["toolChoice"] == {"any": {}}

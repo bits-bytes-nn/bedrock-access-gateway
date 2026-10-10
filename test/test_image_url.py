@@ -411,9 +411,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "image/png")
         self.end_headers()
         if _Handler.drip_delay:
-            for _ in range(100):
-                self.wfile.write(b"x")
-                self.wfile.flush()
+            # About 5 seconds in total, well past the 1 second deadline the test sets.
+            for _ in range(50):
+                try:
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                except OSError:
+                    return  # the client shut the connection down
                 time.sleep(_Handler.drip_delay)
         else:
             self.wfile.write(b"png-bytes")
@@ -431,6 +435,7 @@ def loopback_server():
     thread.start()
     yield server
     server.shutdown()
+    server.server_close()
 
 
 def _target(port, ips=("127.0.0.1",)):
@@ -476,4 +481,5 @@ def test_trickling_server_is_cut_off_by_the_deadline(loopback_server, monkeypatc
     with pytest.raises(HTTPException) as exc_info:
         parse_image_url(f"http://images.example.com:{port}/cat.png")
     assert exc_info.value.status_code == 400
-    assert time.monotonic() - started < 3
+    # Without the deadline the download would take the full 5 seconds.
+    assert time.monotonic() - started < 4

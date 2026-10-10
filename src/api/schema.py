@@ -45,11 +45,6 @@ class ImageContent(BaseModel):
     image_url: ImageUrl
 
 
-class ToolContent(BaseModel):
-    type: Literal["text"] = "text"
-    text: str
-
-
 class SystemMessage(BaseModel):
     name: str | None = None
     role: Literal["system"] = "system"
@@ -71,7 +66,8 @@ class AssistantMessage(BaseModel):
 
 class ToolMessage(BaseModel):
     role: Literal["tool"] = "tool"
-    content: str | list[ToolContent] | list[dict]
+    # Text parts, and image_url parts which Converse accepts in tool results.
+    content: str | list[dict]
     tool_call_id: str
 
 
@@ -145,7 +141,6 @@ class ChatResponseMessage(BaseModel):
     role: Literal["assistant"] | None = None
     content: str | None = None
     tool_calls: list[ToolCall] | None = None
-    reasoning_content: str | None = None
 
 
 class BaseChoice(BaseModel):
@@ -163,7 +158,6 @@ class ChoiceDelta(BaseChoice):
 
 
 class BaseChatResponse(BaseModel):
-    # id: str = Field(default_factory=lambda: "chatcmpl-" + str(uuid.uuid4())[:8])
     id: str
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str

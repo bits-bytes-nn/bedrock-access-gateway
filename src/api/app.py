@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.routers import chat, embeddings, model
-from api.setting import API_ROUTE_PREFIX, DESCRIPTION, SUMMARY, TITLE, VERSION
+from api.setting import ALLOWED_ORIGINS, API_ROUTE_PREFIX, DESCRIPTION, SUMMARY, TITLE, VERSION
 
 config = {
     "title": TITLE,
@@ -23,19 +23,15 @@ logging.basicConfig(
 )
 app = FastAPI(**config)
 
-allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*")
-origins_list = [origin.strip() for origin in allowed_origins.split(",")] if allowed_origins != "*" else ["*"]
-
-# Warn if CORS allows all origins
-if origins_list == ["*"]:
+if "*" in ALLOWED_ORIGINS:
     logging.warning(
         "CORS is configured to allow all origins (*). Set ALLOWED_ORIGINS environment variable to restrict access."
     )
 
+# The API key travels in the Authorization header, so browsers need no cookies (credentials).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins_list,  # nosec - configurable via ALLOWED_ORIGINS env var
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

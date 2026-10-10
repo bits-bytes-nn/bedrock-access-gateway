@@ -8,14 +8,10 @@ exclude = [
 ]
 
 [lint]
-# B catches bug-prone patterns such as raising without "from" inside "except".
-select = ["E", "F", "I", "B"]
-ignore = [
-    "E501",
-    "C901",
-    # Optional hook methods on the abstract base classes are intentionally empty.
-    "B027",
-]
+# B catches bug-prone patterns such as raising without "from" inside "except";
+# G keeps log messages lazily formatted.
+select = ["E", "F", "I", "B", "G", "UP"]
+ignore = ["E501"]
 
 [lint.isort]
 known-first-party = ["api"]

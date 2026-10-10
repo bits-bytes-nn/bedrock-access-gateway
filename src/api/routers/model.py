@@ -4,13 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from starlette.concurrency import run_in_threadpool
 
 from api.auth import api_key_auth
-from api.models.bedrock import BedrockModel
+from api.models.bedrock import BedrockModel, is_model_listed
 from api.schema import Model, Models
 
 router = APIRouter(
     prefix="/models",
     dependencies=[Depends(api_key_auth)],
-    # responses={404: {"description": "Not found"}},
 )
 
 chat_model = BedrockModel()
@@ -18,7 +17,7 @@ chat_model = BedrockModel()
 
 async def validate_model_id(model_id: str):
     # Refreshing the list calls Bedrock with blocking boto3 calls.
-    if model_id not in await run_in_threadpool(chat_model.list_models):
+    if not await run_in_threadpool(is_model_listed, model_id):
         raise HTTPException(status_code=404, detail="Unsupported Model Id")
 
 

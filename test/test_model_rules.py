@@ -9,7 +9,7 @@ import pytest
 from api.models.model_rules import ModelRules, Sampling, Thinking, rules_for
 
 NONE, ONE, BOTH = Sampling.NONE, Sampling.ONE, Sampling.BOTH
-ADAPTIVE, BUDGET = Thinking.ADAPTIVE, Thinking.BUDGET
+ADAPTIVE, BUDGET, NO_THINKING = Thinking.ADAPTIVE, Thinking.BUDGET, Thinking.NONE
 
 
 @pytest.mark.parametrize(
@@ -30,11 +30,11 @@ ADAPTIVE, BUDGET = Thinking.ADAPTIVE, Thinking.BUDGET
         ("anthropic.claude-haiku-4-5-20251001-v1:0", ONE, BUDGET, True, True, True),
         ("anthropic.claude-sonnet-4-20250514-v1:0", BOTH, BUDGET, True, True, True),
         ("anthropic.claude-3-7-sonnet-20250219-v1:0", BOTH, BUDGET, True, True, True),
-        ("anthropic.claude-3-5-haiku-20241022-v1:0", BOTH, BUDGET, True, True, True),
+        ("anthropic.claude-3-5-haiku-20241022-v1:0", BOTH, NO_THINKING, True, True, True),
         # Rejected "unsupported model or your request did not allow prompt caching".
-        ("anthropic.claude-3-5-sonnet-20241022-v2:0", BOTH, BUDGET, True, True, False),
-        ("anthropic.claude-3-5-sonnet-20240620-v1:0", BOTH, BUDGET, True, True, False),
-        ("anthropic.claude-3-haiku-20240307-v1:0", BOTH, BUDGET, True, True, False),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", BOTH, NO_THINKING, True, True, False),
+        ("anthropic.claude-3-5-sonnet-20240620-v1:0", BOTH, NO_THINKING, True, True, False),
+        ("anthropic.claude-3-haiku-20240307-v1:0", BOTH, NO_THINKING, True, True, False),
     ],
 )
 def test_claude_rules_match_bedrock(model_id, sampling, thinking, prefill, forced_tool_choice, prompt_caching):
@@ -65,7 +65,7 @@ def test_date_suffix_is_not_read_as_a_minor_version():
         ("deepseek.v3-v1:0", ModelRules(thinking=Thinking.EFFORT_STRING)),
         ("meta.llama3-1-70b-instruct-v1:0", ModelRules(tool_choice=False)),
         ("openai.gpt-oss-120b-1:0", ModelRules()),
-        ("anthropic.claude-instant-v1", ModelRules(thinking=BUDGET)),
+        ("anthropic.claude-instant-v1", ModelRules()),
     ],
 )
 def test_other_providers(model_id, expected):

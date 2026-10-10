@@ -37,6 +37,8 @@ Use OpenAI-Compatible RESTful APIs for Amazon Bedrock models.
 """
 
 DEBUG = _env_flag("DEBUG", False)
+# Comma-separated origins allowed by CORS, or "*".
+ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "global.anthropic.claude-opus-5-5")
 DEFAULT_EMBEDDING_MODEL = os.environ.get("DEFAULT_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")

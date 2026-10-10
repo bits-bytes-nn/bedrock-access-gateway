@@ -59,9 +59,18 @@ def embed(client, **body):
 # --- auth and request validation -------------------------------------------------
 
 
-def test_wrong_api_key_is_rejected(client):
-    response = client.get("/api/v1/models", headers={"Authorization": "Bearer wrong"})
-    assert response.status_code == 401
+@pytest.mark.parametrize(
+    "method,path", [("get", "/api/v1/models"), ("post", "/api/v1/chat/completions"), ("post", "/api/v1/embeddings")]
+)
+@pytest.mark.parametrize("headers,status", [({"Authorization": "Bearer wrong"}, 401), ({}, (401, 403))])
+def test_every_api_route_requires_the_key(client, method, path, headers, status):
+    response = getattr(client, method)(path, headers=headers)
+    assert response.status_code in (status if isinstance(status, tuple) else (status,))
+
+
+def test_health_check_needs_no_key(client):
+    # The Lambda Web Adapter readiness check calls /health without credentials.
+    assert client.get("/health").status_code == 200
 
 
 def test_validation_error_is_json_without_internals(client):
@@ -81,7 +90,7 @@ def test_unknown_model_is_not_found(client):
 
 def test_model_lookup_accepts_arn_ids(client, monkeypatch):
     arn = "arn:aws:bedrock:ap-northeast-2:123456789012:application-inference-profile/abc"
-    monkeypatch.setattr(bedrock_module.BedrockModel, "list_models", lambda self: [arn])
+    monkeypatch.setattr(bedrock_module, "bedrock_model_list", {arn: {"modalities": ["TEXT"]}})
     assert client.get(f"/api/v1/models/{arn}", headers=AUTH).status_code == 200
 
 
@@ -151,6 +160,7 @@ def test_prompt_caching_flag_with_wrong_shape_is_ignored(client, runtime):
         extra_body={"prompt_caching": True},
     )
     assert response.status_code == 200
+    assert cache_points(sent_args(runtime)) == (0, 0)
 
 
 # --- chat: request conversion ------------------------------------------------------
@@ -451,7 +461,7 @@ def test_model_discovery_maps_profiles_to_models(monkeypatch):
         ]
     }
     monkeypatch.setattr(bedrock_module, "bedrock_client", fake)
-    monkeypatch.setattr(bedrock_module, "profile_metadata", {})
+    monkeypatch.setattr(bedrock_module, "profile_models", {})
 
     models = bedrock_module.list_bedrock_models()
 
@@ -460,9 +470,7 @@ def test_model_discovery_maps_profiles_to_models(monkeypatch):
         "arn:aws:bedrock:ap-northeast-2:123456789012:application-inference-profile/app",
         "global.anthropic.claude-opus-5-5",
     ]
-    assert bedrock_module.profile_metadata["global.anthropic.claude-opus-5-5"]["underlying_model_id"] == (
-        "anthropic.claude-opus-5-5"
-    )
+    assert bedrock_module.profile_models["global.anthropic.claude-opus-5-5"] == "anthropic.claude-opus-5-5"
 
 
 def test_openai_model_names_use_the_defaults(client, runtime, monkeypatch):
@@ -621,6 +629,8 @@ def test_stream_usage_chunk_only_when_requested(client, runtime, stream_options,
     lines = [line for line in chat(client, **body).text.splitlines() if line.startswith("data: {")]
     usage_chunks = [json.loads(line[6:]) for line in lines if json.loads(line[6:])["choices"] == []]
     assert bool(usage_chunks) is expect_usage
+    content_chunks = [json.loads(line[6:]) for line in lines if json.loads(line[6:])["choices"]]
+    assert all("usage" in chunk and chunk["usage"] is None for chunk in content_chunks)
 
 
 @pytest.mark.parametrize(
@@ -746,7 +756,3 @@ def test_api_key_is_read_from_secrets_manager(monkeypatch):
     finally:
         monkeypatch.delenv("API_KEY_SECRET_ARN")
         importlib.reload(auth)
-
-
-def test_missing_authorization_header_is_rejected(client):
-    assert client.get("/api/v1/models").status_code in (401, 403)

@@ -2,7 +2,7 @@ import logging
 import time
 import uuid
 from abc import ABC, abstractmethod
-from typing import AsyncIterable
+from collections.abc import AsyncIterable
 
 from api.schema import (
     # Chat
@@ -23,14 +23,6 @@ class BaseChatModel(ABC):
 
     Currently, only Bedrock model is supported, but may be used for SageMaker models if needed.
     """
-
-    def list_models(self) -> list[str]:
-        """Return a list of supported models"""
-        return []
-
-    def validate(self, chat_request: ChatRequest):
-        """Validate chat completion requests."""
-        pass
 
     @abstractmethod
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
@@ -60,7 +52,7 @@ class BaseChatModel(ABC):
         else:
             data = "[DONE]"
 
-        return f"data: {data}\n\n".encode("utf-8")
+        return f"data: {data}\n\n".encode()
 
 
 class BaseEmbeddingsModel(ABC):

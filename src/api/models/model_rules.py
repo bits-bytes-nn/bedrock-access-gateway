@@ -32,7 +32,8 @@ class Thinking(Enum):
     """How reasoning_effort is expressed for a model."""
 
     NONE = "none"
-    # reasoning_config with budget_tokens (Claude 3.7 to Opus 4.6).
+    # reasoning_config with budget_tokens (Claude 3.7 to Opus 4.6). Extended thinking
+    # rejects a temperature other than 1, topP, and a forced tool choice.
     BUDGET = "budget"
     # thinking.type adaptive with output_config.effort ("thinking.type.enabled" is rejected).
     ADAPTIVE = "adaptive"
@@ -82,7 +83,8 @@ def _claude_rules(family: str, version: tuple[int, int]) -> ModelRules:
     elif version >= (4, 5):
         sampling, thinking = Sampling.ONE, Thinking.BUDGET
     else:
-        sampling, thinking = Sampling.BOTH, Thinking.BUDGET
+        # Extended thinking starts with Claude 3.7 Sonnet.
+        sampling, thinking = Sampling.BOTH, Thinking.BUDGET if version >= (3, 7) else Thinking.NONE
 
     # Fable and Mythos reject forced tool choice in every version; Opus and Sonnet from 5.5.
     forced_tool_choice = not (family in {"fable", "mythos"} or (family in {"opus", "sonnet"} and version >= (5, 5)))
@@ -105,8 +107,8 @@ def rules_for(model_id: str) -> ModelRules:
         parsed = _claude_version(model_id)
         if parsed:
             return _claude_rules(*parsed)
-        # Unrecognised Claude ids (instant, v2) keep the permissive defaults.
-        return ModelRules(thinking=Thinking.BUDGET)
+        # Unrecognised Claude ids (instant, v2) predate extended thinking.
+        return ModelRules()
 
     if "amazon.nova" in model_id:
         return ModelRules(prompt_caching=True)
