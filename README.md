@@ -64,7 +64,7 @@ You can also use Lambda Function URL as an alternative, see [example](https://gi
 
 ### Deployment
 
-Please follow the steps below to deploy the Bedrock Proxy APIs into your AWS account. Only supports regions where Amazon Bedrock is available (such as `us-west-2`). The deployment will take approximately **10-15 minutes**.
+Please follow the steps below to deploy the Bedrock Proxy APIs into your AWS account. Only supports regions where Amazon Bedrock is available (such as `us-west-2`).
 
 The steps below use the console. For the API Gateway + Lambda option, [`scripts/deploy-lambda.sh`](scripts/deploy-lambda.sh)
 replaces Steps 2 and 3 for an existing stack, see [How to upgrade?](#how-to-upgrade).
@@ -129,13 +129,18 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 
 5. On the "Specify stack details" page, provide the following information:
    - **Stack name**: Enter a stack name (e.g., "BedrockProxyAPI")
-   - **ApiKeySecretArn**: Enter the secret ARN from Step 1
+   - **ApiKeySecretArn**: Enter the full secret ARN from Step 1, including its 6-character suffix
    - **ContainerImageUri**: Enter the ECR image URI from Step 2 output
-   - **DefaultModelId**: (Optional) Model used for OpenAI model names such as `gpt-4o` (default `global.anthropic.claude-opus-5-5`)
+   - **DefaultModelId**: (Optional) Model used for OpenAI model names such as `gpt-4o` (default `global.anthropic.claude-opus-5-5`
+     for the Lambda template; the Fargate template has an older default, set it explicitly)
+
+   The remaining parameters exist in the Lambda template only:
    - **DefaultEmbeddingModelId**: (Optional) Model used for OpenAI embedding model names such as `text-embedding-3-small` (default `amazon.titan-embed-text-v2:0`)
    - **EnablePromptCaching**: (Optional) Add cache points for models that support prompt caching
    - **EnableImageUrlFetch**, **ImageUrlAllowedHosts**: (Optional) Controls for remote image URLs, see the [Security Guide](./docs/Security.md)
    - **LogRetentionInDays**: (Optional) How long the function logs are kept (default 90)
+   - **ThrottlingRateLimit**, **ThrottlingBurstLimit**: (Optional) Requests per second and burst the API accepts
+     (default 10 and 20), which caps the Bedrock spend if the API key leaks
 
    Click "Next".
 
@@ -321,8 +326,7 @@ Make sure you use `ChatOpenAI(...)` instead of `OpenAI(...)`
 # pip install langchain-openai
 import os
 
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
 chat = ChatOpenAI(
@@ -337,11 +341,11 @@ template = """Question: {question}
 Answer: Let's think step by step."""
 
 prompt = PromptTemplate.from_template(template)
-llm_chain = LLMChain(prompt=prompt, llm=chat)
+chain = prompt | chat
 
 question = "What NFL team won the Super Bowl in the year Justin Beiber was born?"
-response = llm_chain.invoke(question)
-print(response)
+response = chain.invoke({"question": question})
+print(response.content)
 ```
 
 ## FAQs
@@ -403,7 +407,15 @@ AWS_REGION=<region> STACK_NAME=<stack name> scripts/deploy-lambda.sh
 
 The script tags the image with the git commit, pins `ContainerImageUri` to the pushed digest, applies the
 current template and keeps every other parameter's value. Pass overrides with `PARAMETERS="Key=Value ..."`.
-To roll back, check out the earlier commit and run the script again.
+To roll back, redeploy the earlier image by digest, which skips the build (images are tagged with their commit
+in ECR):
+
+```bash
+AWS_REGION=<region> IMAGE_URI=<account>.dkr.ecr.<region>.amazonaws.com/bedrock-proxy-api@sha256:<digest> \
+  scripts/deploy-lambda.sh --preview
+```
+
+Rebuilding an old commit does not reproduce its image exactly, because the build applies the latest OS patches.
 
 Parameters added to the template since the stack was created take their template defaults on the first run.
 If you set the matching environment variables on the function by hand (for example `ENABLE_IMAGE_URL_FETCH`),
@@ -442,9 +454,16 @@ Boolean settings accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); a
 pip install -r requirements-dev.txt   # or: uv pip install -r requirements-dev.txt
 ruff check . && ruff format --check .
 pytest
+cfn-lint deployment/BedrockProxy.template
+shellcheck scripts/*.sh
 ```
 
-The tests replace the AWS clients with mocks and never call AWS. CI runs the same commands on pushes to `main` and on pull requests.
+The tests replace the AWS clients with mocks and never call AWS. CI runs the same commands on pushes to `main`
+and on pull requests, and also builds the Lambda image.
+
+Runtime dependencies are declared in [`src/requirements.in`](src/requirements.in) and locked, transitive
+dependencies included, in `src/requirements.txt`. After changing `requirements.in`, regenerate the lock with the
+command at the top of that file.
 
 ### Supporting a new model family
 

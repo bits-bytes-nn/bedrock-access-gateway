@@ -13,7 +13,7 @@ A clear and concise description of what the bug is.
 
 **Please complete the following information:**
 - [ ] Which API you used: [e.g. /chat/completions]
-- [ ] Which model you used: [e.g. anthropic.claude-3-sonnet-20240229-v1:0]
+- [ ] Which model you used: [e.g. global.anthropic.claude-opus-5-5]
 
 **To Reproduce**
 Steps to reproduce the behavior. If possible, please share an example request.

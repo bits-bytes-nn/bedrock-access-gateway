@@ -36,7 +36,7 @@ HTTP status.
 | `403` | Bedrock denied access to the model. The message is generic; the full error, including the role, is in the logs |
 | `404` | Unknown model id in `GET /models/{id}`, or a Bedrock `ResourceNotFoundException` |
 | `413` | A remote image is larger than `IMAGE_URL_MAX_SIZE_MB` |
-| `429` | Bedrock throttling or quota exceeded |
+| `429` | Bedrock throttling or quota exceeded, or the API Gateway stage limit (`{"message":"Too Many Requests"}`) |
 | `502` / `503` / `504` | Bedrock model error, model or service unavailable, or model timeout |
 | `500` | Unexpected error; see the logs |
 
@@ -47,7 +47,8 @@ HTTP status.
 The application reads the API key when it starts and stops if it cannot:
 
 - `API Key is not configured`: none of `API_KEY_SECRET_ARN`, `API_KEY_PARAM_NAME` or `API_KEY` is set.
-- `Unable to retrieve API KEY`: the secret ARN is wrong, or the function role cannot read it.
+- `Unable to retrieve API KEY`: the secret ARN is wrong, or the function role cannot read it. The stack needs the
+  full ARN, including the 6-character suffix Secrets Manager adds to the name.
 - `Please ensure the secret is a JSON string with an "api_key" field`: store the secret as key/value with the
   key `api_key`.
 - `... must be true or false` or `... must be a positive integer`: a setting has an invalid value, see
@@ -76,6 +77,9 @@ OpenAI GPT models on Bedrock reject `temperature` and `max_tokens`; use `max_com
 
 ### Throttling (429)
 
+- A `{"message":"Too Many Requests"}` body comes from API Gateway: the stage accepts `ThrottlingRateLimit`
+  requests per second with bursts up to `ThrottlingBurstLimit`. Raise them through the stack parameters if the
+  client needs more.
 - Check the Bedrock service quotas for the model in the AWS console and request an increase if needed.
 - The gateway retries throttled calls a few times; add retries with backoff in your client for sustained load.
 

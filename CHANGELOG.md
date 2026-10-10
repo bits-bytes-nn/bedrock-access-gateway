@@ -5,6 +5,11 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 ## Unreleased
 
 ### Added
+- API Gateway stage throttling, set by the `ThrottlingRateLimit` (default 10 requests per second) and
+  `ThrottlingBurstLimit` (default 20) stack parameters, to bound the spend if the API key leaks.
+- `IMAGE_URI` for `scripts/deploy-lambda.sh` redeploys a pushed image by digest, for rollbacks.
+- `src/requirements.in`; `src/requirements.txt` is now a full lock including transitive dependencies.
+- CI lints the template (cfn-lint) and scripts (shellcheck) and builds the Lambda image.
 - `src/api/models/model_rules.py`: one table of per-model request rules, keyed by Claude family and version.
   Future Claude versions inherit the newest rules.
 - Model list refresh when a request names a model that is not listed (at most once a minute), so a model
@@ -15,6 +20,13 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 - `requirements-dev.txt`, pytest configuration and a CI workflow (ruff and pytest).
 
 ### Changed
+- With extended thinking (Claude 3.7 Sonnet to Opus 4.6), `temperature` is dropped and a forced tool choice
+  falls back to `auto`; Bedrock rejected both combinations. Claude 3.5 and earlier ignore `reasoning_effort`
+  instead of failing.
+- A leading `<think>` block in assistant history is removed before the conversation is sent to Bedrock.
+- `GET /models/{id}` uses the cached model list, refreshing it (at most once a minute) only for unknown ids.
+- CORS no longer allows credentials; the API key is sent in the `Authorization` header.
+- `ApiKeySecretArn` must be the full secret ARN, which the IAM policy needs to match.
 - Prompt caching is only applied to models that support it (Claude 3.7 Sonnet, Claude 3.5 Haiku and later,
   Nova). Claude 3 Haiku and 3.5 Sonnet previously failed every request while caching was enabled.
 - Claude Opus 4.6 no longer receives `temperature` and `top_p` together.
@@ -32,6 +44,7 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 
 ### Removed
 - `mangum`, unused with the Lambda Web Adapter.
+- The unused `reasoning_content` response field.
 
 ## 2026-10-10
 

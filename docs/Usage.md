@@ -204,7 +204,7 @@ curl $OPENAI_BASE_URL/chat/completions \
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": "https://github.com/aws-samples/bedrock-access-gateway/blob/main/assets/obj-detect.png?raw=true"
+                        "url": "https://github.com/bits-bytes-nn/bedrock-access-gateway/blob/main/assets/obj-detect.png?raw=true"
                     }
                 }
             ]
@@ -248,7 +248,7 @@ curl $OPENAI_BASE_URL/chat/completions \
 {
     "id": "msg_01BY3wcz41x7XrKhxY3VzWke",
     "created": 1712543069,
-    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "model": "global.anthropic.claude-opus-5-5",
     "system_fingerprint": "fp",
     "choices": [
         {
@@ -383,9 +383,10 @@ gateway expresses it depends on the model family:
 | Models | What `reasoning_effort` becomes | Notes |
 |---|---|---|
 | Claude Opus 4.7, Opus 4.8 and Claude 5.x | Adaptive thinking: `thinking.type: adaptive` with `output_config.effort` | `max_tokens` is not required. These models reject `temperature` and `top_p`, so both are dropped. |
-| Claude 3.7 Sonnet to Claude Opus 4.6 | Extended thinking with `budget_tokens` of 30% (low), 60% (medium) or 80% (high) of `max_tokens`, at least 1,024 | `max_tokens` (or `max_completion_tokens`) is required and must be above 1,024. `top_p` is dropped while thinking. |
+| Claude 3.7 Sonnet to Claude Opus 4.6 | Extended thinking with `budget_tokens` of 30% (low), 60% (medium) or 80% (high) of `max_tokens`, at least 1,024 | `max_tokens` (or `max_completion_tokens`) is required and must be above 1,024. While thinking, `temperature` and `top_p` are dropped and a forced tool choice falls back to `auto`, which Bedrock requires. |
 | DeepSeek V3 | `reasoning_config` set to the effort string | |
 | DeepSeek R1, OpenAI GPT, Kimi, GLM | Ignored; these models reason on their own | |
+| Claude 3.5 and earlier | Ignored; no extended thinking | |
 
 Other per-model adjustments the gateway makes (see [`model_rules.py`](../src/api/models/model_rules.py)):
 
@@ -397,7 +398,9 @@ Other per-model adjustments the gateway makes (see [`model_rules.py`](../src/api
 
 The reasoning text is returned inside the message content, wrapped in `<think>` and `</think>`, followed by
 the answer. In streaming responses the tags arrive as part of the content deltas. Models that return
-encrypted reasoning (OpenAI GPT) contribute no `<think>` block.
+encrypted reasoning (OpenAI GPT) contribute no `<think>` block. When a client sends an earlier answer back in the
+conversation history, a leading `<think>...</think>` block is removed from it, so the model does not read its old
+reasoning as answer text.
 
 > **Note**: Omitting `max_tokens` (or `max_completion_tokens`) lets Bedrock use the model's native maximum
 > output rather than a fixed cap. Set `max_tokens` explicitly if you need to control costs or latency.
