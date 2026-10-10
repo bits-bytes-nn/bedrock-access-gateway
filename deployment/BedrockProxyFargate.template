@@ -2,15 +2,40 @@ Description: Bedrock Access Gateway - OpenAI-compatible RESTful APIs for Amazon 
 Parameters:
   ApiKeySecretArn:
     Type: String
-    AllowedPattern: ^arn:aws:secretsmanager:.*$
-    Description: The secret ARN in Secrets Manager used to store the API Key
+    # The full ARN, with the random suffix: the IAM policy below must match it exactly.
+    AllowedPattern: ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+-[A-Za-z0-9]{6}$
+    Description: The full ARN (including the 6-character suffix) of the Secrets Manager secret that stores the API Key
   ContainerImageUri:
     Type: String
-    Description: The ECR image URI for the ECS/Fargate task (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/bedrock-proxy-api-ecs:latest)
+    Description: The ECR image URI for the ECS/Fargate task (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/bedrock-proxy-api-ecs:<git commit>). Use a unique tag or a digest; an unchanged URI does not redeploy the service.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for an HTTPS listener on port 443, with HTTP redirected to HTTPS. Empty serves plain HTTP, which sends the API key unencrypted.
   DefaultModelId:
     Type: String
-    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Default: global.anthropic.claude-opus-5-5
     Description: The default model ID, please make sure the model ID is supported in the current region
+  DefaultEmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: The embedding model used for OpenAI embedding model names (text-embedding-*), please make sure it is supported in the current region
+  LogRetentionInDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365, 731]
+    Description: How long CloudWatch keeps the container logs
+  EnableImageUrlFetch:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Allow image_url content parts that point at remote http(s) URLs. When false, only base64 data URLs are accepted.
+  ImageUrlAllowedHosts:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated list of hosts remote image URLs may point at. Empty allows any publicly routable host.
   EnablePromptCaching:
     Type: String
     Default: "false"
@@ -18,6 +43,8 @@ Parameters:
       - "true"
       - "false"
     Description: Enable prompt caching for supported models (Claude, Nova). When enabled, adds cachePoint to system prompts and messages for cost savings.
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
 Resources:
   VPCB9E5F0B4:
     Type: AWS::EC2::VPC
@@ -147,10 +174,9 @@ Resources:
               - logs:CreateLogStream
               - logs:PutLogEvents
             Effect: Allow
-            Resource: "*"
+            Resource: !GetAtt ProxyLogGroup.Arn
           - Action:
               - secretsmanager:GetSecretValue
-              - secretsmanager:DescribeSecret
             Effect: Allow
             Resource:
               Ref: ApiKeySecretArn
@@ -162,7 +188,7 @@ Resources:
             Resource:
               Fn::Join:
                 - ""
-                - - "arn:aws:ecr:"
+                - - !Sub "arn:${AWS::Partition}:ecr:"
                   - Fn::Select:
                       - 3
                       - Fn::Split:
@@ -182,16 +208,9 @@ Resources:
                               - Fn::Split:
                                   - "/"
                                   - Ref: ContainerImageUri
-                  - ":repository/"
-                  - Fn::Select:
-                      - 0
-                      - Fn::Split:
-                          - ":"
-                          - Fn::Select:
-                              - 1
-                              - Fn::Split:
-                                  - "/"
-                                  - Ref: ContainerImageUri
+                  # Every repository in the image's registry: parsing the repository name out
+                  # of the URI breaks for digests (repo@sha256:...) and namespaced names.
+                  - ":repository/*"
           - Action: ecr:GetAuthorizationToken
             Effect: Allow
             Resource: "*"
@@ -224,13 +243,18 @@ Resources:
               - bedrock:InvokeModelWithResponseStream
             Effect: Allow
             Resource:
-              - arn:aws:bedrock:*::foundation-model/*
-              - arn:aws:bedrock:*:*:inference-profile/*
-              - arn:aws:bedrock:*:*:application-inference-profile/*
+              - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:*:*:application-inference-profile/*"
         Version: "2012-10-17"
       PolicyName: ProxyTaskRoleDefaultPolicy933321B8
       Roles:
         - Ref: ProxyTaskRole5DB6A540
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-proxy-api"
+      RetentionInDays: !Ref LogRetentionInDays
   ProxyBedrockCluster893F4261:
     Type: AWS::ECS::Cluster
   ProxyBedrockClusterD9C31EFF:
@@ -253,7 +277,8 @@ Resources:
               Value:
                 Ref: DefaultModelId
             - Name: DEFAULT_EMBEDDING_MODEL
-              Value: cohere.embed-multilingual-v3
+              Value:
+                Ref: DefaultEmbeddingModelId
             - Name: ENABLE_CROSS_REGION_INFERENCE
               Value: "true"
             - Name: ENABLE_APPLICATION_INFERENCE_PROFILES
@@ -261,7 +286,19 @@ Resources:
             - Name: ENABLE_PROMPT_CACHING
               Value:
                 Ref: EnablePromptCaching
+            - Name: ENABLE_IMAGE_URL_FETCH
+              Value:
+                Ref: EnableImageUrlFetch
+            - Name: IMAGE_URL_ALLOWED_HOSTS
+              Value:
+                Ref: ImageUrlAllowedHosts
           Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProxyLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: proxy-api
           Image:
             Ref: ContainerImageUri
           Name: proxy-api
@@ -306,6 +343,10 @@ Resources:
           AlarmNames: []
           Enable: false
           Rollback: false
+        # Roll back a deployment whose tasks keep failing instead of retrying forever.
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
         MaximumPercent: 200
         MinimumHealthyPercent: 50
       DesiredCount: 1
@@ -330,9 +371,9 @@ Resources:
         Ref: ProxyTaskDef9F2A72E5
     DependsOn:
       - ProxyALBListener933E9515
-      - ProxyALBListenerTargetsGroup187739FA
       - ProxyTaskRoleDefaultPolicy933321B8
-      - ProxyTaskRole5DB6A540
+      # Deleted after the service, which would otherwise block removing the capacity providers.
+      - ProxyBedrockClusterD9C31EFF
   ProxyApiServiceSecurityGroup51EBD9B8:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -345,7 +386,6 @@ Resources:
         Ref: VPCB9E5F0B4
     DependsOn:
       - ProxyTaskRoleDefaultPolicy933321B8
-      - ProxyTaskRole5DB6A540
   ProxyApiServiceSecurityGroupfromBedrockProxyFargateProxyALBSecurityGroup9C12825880081F8FE2:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -363,7 +403,6 @@ Resources:
       ToPort: 8080
     DependsOn:
       - ProxyTaskRoleDefaultPolicy933321B8
-      - ProxyTaskRole5DB6A540
   ProxyALB87756780:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -372,6 +411,8 @@ Resources:
           Value: "false"
         - Key: idle_timeout.timeout_seconds
           Value: "600"
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
       Scheme: internet-facing
       SecurityGroups:
         - Fn::GetAtt:
@@ -396,6 +437,14 @@ Resources:
           FromPort: 80
           IpProtocol: tcp
           ToPort: 80
+        - !If
+          - HasCertificate
+          - CidrIp: 0.0.0.0/0
+            Description: Allow from anyone on port 443
+            FromPort: 443
+            IpProtocol: tcp
+            ToPort: 443
+          - !Ref AWS::NoValue
       VpcId:
         Ref: VPCB9E5F0B4
   ProxyALBSecurityGrouptoBedrockProxyFargateProxyApiServiceSecurityGroupDDA1C56480393D1E44:
@@ -413,17 +462,40 @@ Resources:
           - GroupId
       IpProtocol: tcp
       ToPort: 8080
+  # Port 80 forwards to the service without a certificate and redirects to HTTPS with one.
   ProxyALBListener933E9515:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - TargetGroupArn:
+              Ref: ProxyALBListenerTargetsGroup187739FA
+            Type: forward
+      LoadBalancerArn:
+        Ref: ProxyALB87756780
+      Port: 80
+      Protocol: HTTP
+  ProxyALBHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
       DefaultActions:
         - TargetGroupArn:
             Ref: ProxyALBListenerTargetsGroup187739FA
           Type: forward
       LoadBalancerArn:
         Ref: ProxyALB87756780
-      Port: 80
-      Protocol: HTTP
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
   ProxyALBListenerTargetsGroup187739FA:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -442,12 +514,10 @@ Resources:
 Outputs:
   APIBaseUrl:
     Description: Proxy API Base URL (OPENAI_API_BASE)
-    Value:
-      Fn::Join:
-        - ""
-        - - http://
-          - Fn::GetAtt:
-              - ProxyALB87756780
-              - DNSName
-          - /api/v1
-
+    Value: !If
+      - HasCertificate
+      - "https://<a domain in the certificate, pointed at ALBDnsName>/api/v1"
+      - !Sub "http://${ProxyALB87756780.DNSName}/api/v1"
+  ALBDnsName:
+    Description: DNS name of the load balancer; with a certificate, point the certificate's domain at it
+    Value: !GetAtt ProxyALB87756780.DNSName

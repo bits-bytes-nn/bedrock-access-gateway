@@ -25,7 +25,7 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest --cov=src/api --cov-report=term-missing
-      - run: cfn-lint deployment/BedrockProxy.template
+      - run: cfn-lint deployment/*.template
       # shellcheck is preinstalled on the GitHub-hosted Ubuntu runners.
       - run: shellcheck scripts/*.sh
 

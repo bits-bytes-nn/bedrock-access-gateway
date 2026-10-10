@@ -7,5 +7,5 @@ httpx2==2.13.1
 # Response models from the OpenAI SDK are used as contract checks in the tests.
 openai==3.28.0
 ruff==0.17.0
-# Lints deployment/BedrockProxy.template.
+# Lints the CloudFormation templates in deployment/.
 cfn-lint==1.57.2
