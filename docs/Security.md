@@ -137,7 +137,7 @@ definition.
 In addition:
 
 - **Scope the task role.** This is the control that limits the damage if the credential endpoint is ever
-  reached. The bundled templates grant the role only `bedrock:InvokeModel`,
+  reached. The Lambda template grants the role only `bedrock:InvokeModel`,
   `bedrock:InvokeModelWithResponseStream`, `bedrock:ListFoundationModels`,
   `bedrock:ListInferenceProfiles` and `secretsmanager:GetSecretValue` on the API key secret (plus
   CloudWatch Logs). Keep it that narrow; credentials obtained through any future SSRF-style issue then grant

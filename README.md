@@ -405,6 +405,11 @@ The script tags the image with the git commit, pins `ContainerImageUri` to the p
 current template and keeps every other parameter's value. Pass overrides with `PARAMETERS="Key=Value ..."`.
 To roll back, check out the earlier commit and run the script again.
 
+Parameters added to the template since the stack was created take their template defaults on the first run.
+If you set the matching environment variables on the function by hand (for example `ENABLE_IMAGE_URL_FETCH`),
+check them with `aws lambda get-function-configuration` first and pass them through `PARAMETERS`, because a
+stack update replaces the function's whole environment.
+
 For the Fargate stack, push new images with `scripts/push-to-ecr.sh` and update the stack.
 
 ## Configuration
@@ -439,7 +444,7 @@ ruff check . && ruff format --check .
 pytest
 ```
 
-The tests replace the AWS clients with mocks and never call AWS. CI runs the same commands on every push and pull request.
+The tests replace the AWS clients with mocks and never call AWS. CI runs the same commands on pushes to `main` and on pull requests.
 
 ### Supporting a new model family
 

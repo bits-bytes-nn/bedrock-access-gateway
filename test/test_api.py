@@ -530,7 +530,37 @@ def test_empty_text_blocks_are_left_out(client, runtime):
     assert args["messages"][0]["content"] == [{"text": "hi"}, {"text": "again"}]
 
 
+def test_blank_user_turn_is_rejected_rather_than_dropped(client, runtime):
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+        {"role": "user", "content": [{"type": "text", "text": " "}]},
+    ]
+    assert chat(client, messages=messages).status_code == 400
+
+
 PNG = "data:image/png;base64,iVBORw0KGgo="
+
+
+def tool_turn(content):
+    return [
+        {"role": "user", "content": "look"},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": content},
+    ]
+
+
+def test_remote_images_in_tool_results_count_toward_the_cap(client, runtime, monkeypatch):
+    monkeypatch.setattr(bedrock_module, "parse_image_url", lambda url: (_ for _ in ()).throw(AssertionError("fetched")))
+    images = [{"type": "image_url", "image_url": {"url": f"https://example.com/{i}.png"}} for i in range(21)]
+    assert chat(client, messages=tool_turn(images), tools=[TOOL]).status_code == 400
+
+
+def test_malformed_tool_result_image_is_a_client_error(client, runtime):
+    assert chat(client, messages=tool_turn([{"type": "image_url", "image_url": {}}]), tools=[TOOL]).status_code == 400
 
 
 def test_tool_results_keep_text_and_images(client, runtime):

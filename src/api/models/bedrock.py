@@ -55,8 +55,8 @@ logger = logging.getLogger(__name__)
 
 config = Config(
     connect_timeout=60,
-    # Below the 600 second Lambda and API Gateway limits, so a stalled call fails with
-    # a Bedrock error the gateway can report instead of the function being killed.
+    # Below the 600 second Lambda and API Gateway limits, so a stalled stream fails with an
+    # error event. A stalled non-streaming call is retried and still hits the Lambda limit.
     read_timeout=550,
     retries={"max_attempts": 3, "mode": "standard"},
     max_pool_connections=50,
@@ -592,6 +592,19 @@ class BedrockModel(BaseChatModel):
                 continue
         return self._reframe_multi_payloard(messages, chat_request)
 
+    @staticmethod
+    def _image_urls(chat_request: ChatRequest):
+        """Yield the url of every image part, including images inside tool results."""
+        for message in chat_request.messages:
+            if not isinstance(message.content, list):
+                continue
+            for part in message.content:
+                if isinstance(part, ImageContent):
+                    yield part.image_url.url
+                elif isinstance(part, dict) and part.get("type") == "image_url":
+                    image_url = part.get("image_url")
+                    yield image_url.get("url") if isinstance(image_url, dict) else None
+
     def _tool_result_content(self, content, model_id: str) -> list[dict]:
         """Convert OpenAI tool message content into Converse tool result blocks.
 
@@ -604,13 +617,16 @@ class BedrockModel(BaseChatModel):
         blocks = []
         for item in content:
             if isinstance(item, dict):
-                if item.get("type") == "image_url" and isinstance(item.get("image_url"), dict):
+                if item.get("type") == "image_url":
+                    url = item.get("image_url", {}).get("url") if isinstance(item.get("image_url"), dict) else None
+                    if not isinstance(url, str):
+                        raise HTTPException(status_code=400, detail="Tool result image_url must contain a url")
                     if not self.is_supported_modality(model_id, modality="IMAGE"):
                         raise HTTPException(
                             status_code=400,
                             detail=f"Multimodal message is currently not supported by {model_id}",
                         )
-                    image_data, content_type = self._parse_image(item["image_url"]["url"])
+                    image_data, content_type = self._parse_image(url)
                     blocks.append({"image": {"format": content_type[6:], "source": {"bytes": image_data}}})
                 elif isinstance(item.get("text"), str):
                     blocks.append({"text": item["text"]})
@@ -716,11 +732,7 @@ class BedrockModel(BaseChatModel):
         Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
         """
         remote_images = sum(
-            1
-            for message in chat_request.messages
-            if isinstance(message, (UserMessage, AssistantMessage)) and isinstance(message.content, list)
-            for part in message.content
-            if isinstance(part, ImageContent) and not part.image_url.url.startswith("data:")
+            1 for url in self._image_urls(chat_request) if not (isinstance(url, str) and url.startswith("data:"))
         )
         if remote_images > MAX_REMOTE_IMAGES_PER_REQUEST:
             raise HTTPException(
@@ -1179,6 +1191,9 @@ class BedrockModel(BaseChatModel):
             else:
                 # Ignore..
                 continue
+        if not content_parts and isinstance(message, UserMessage):
+            # Dropping the whole turn would silently change how the conversation ends.
+            raise HTTPException(status_code=400, detail="User message content must not be empty")
         return content_parts
 
     @staticmethod
