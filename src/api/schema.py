@@ -1,7 +1,7 @@
 import time
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from api.setting import DEFAULT_MODEL
 
@@ -93,6 +93,22 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class JsonSchemaFormat(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    description: str | None = None
+    # "schema" would shadow a BaseModel attribute.
+    schema_: dict = Field(alias="schema")
+    # Bedrock always enforces the schema, so strict needs no translation.
+    strict: bool | None = None
+
+
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: JsonSchemaFormat | None = None
+
+
 class ChatRequest(BaseModel):
     messages: list[SystemMessage | UserMessage | AssistantMessage | ToolMessage | DeveloperMessage]
     model: str = DEFAULT_MODEL
@@ -107,7 +123,7 @@ class ChatRequest(BaseModel):
     max_completion_tokens: int | None = Field(default=None, ge=1)
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     n: int | None = Field(default=1, ge=1)  # Only 1 is supported
-    response_format: dict | None = None  # Not supported; logged and ignored
+    response_format: ResponseFormat | None = None
     tools: list[Tool] | None = None
     tool_choice: str | object = "auto"
     stop: list[str] | str | None = None

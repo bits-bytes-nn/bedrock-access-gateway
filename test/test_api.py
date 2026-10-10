@@ -756,3 +756,72 @@ def test_api_key_is_read_from_secrets_manager(monkeypatch):
     finally:
         monkeypatch.delenv("API_KEY_SECRET_ARN")
         importlib.reload(auth)
+
+
+# --- response_format -----------------------------------------------------------------
+
+CITY_SCHEMA = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+    "additionalProperties": False,
+}
+JSON_SCHEMA_FORMAT = {"type": "json_schema", "json_schema": {"name": "city", "schema": CITY_SCHEMA, "strict": True}}
+
+
+def test_json_schema_response_format_becomes_output_config(client, runtime):
+    runtime.converse.return_value = converse_result([{"text": '{"city": "Seoul"}'}])
+    assert chat(client, response_format=JSON_SCHEMA_FORMAT).status_code == 200
+    json_schema = sent_args(runtime)["outputConfig"]["textFormat"]["structure"]["jsonSchema"]
+    assert json_schema["name"] == "city"
+    assert json.loads(json_schema["schema"]) == CITY_SCHEMA
+
+
+@pytest.mark.parametrize("response_format", [{"type": "json_schema"}, {"type": "yaml"}])
+def test_invalid_response_format_is_a_client_error(client, runtime, response_format):
+    assert chat(client, response_format=response_format).status_code == 400
+
+
+def test_json_object_response_format_adds_an_instruction(client, runtime):
+    runtime.converse.return_value = converse_result([{"text": "{}"}])
+    chat(client, response_format={"type": "json_object"})
+    args = sent_args(runtime)
+    assert "outputConfig" not in args
+    assert args["system"] == [{"text": bedrock_module.JSON_OBJECT_INSTRUCTION}]
+
+
+def test_text_response_format_changes_nothing(client, runtime):
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    chat(client, response_format={"type": "text"})
+    args = sent_args(runtime)
+    assert "outputConfig" not in args and args["system"] == []
+
+
+def test_json_response_keeps_reasoning_out_of_the_content(client, runtime):
+    runtime.converse.return_value = converse_result(
+        [{"reasoningContent": {"reasoningText": {"text": "plan"}}}, {"text": '{"city": "Seoul"}'}]
+    )
+    body = chat(client, response_format=JSON_SCHEMA_FORMAT).json()
+    assert json.loads(body["choices"][0]["message"]["content"]) == {"city": "Seoul"}
+    assert body["usage"]["completion_tokens_details"]["reasoning_tokens"] > 0
+
+
+def test_json_stream_keeps_reasoning_out_of_the_content(client, runtime):
+    def delta(value):
+        return {"contentBlockDelta": {"contentBlockIndex": 0, "delta": value}}
+
+    runtime.converse_stream.return_value = {
+        "stream": iter(
+            [
+                {"messageStart": {"role": "assistant"}},
+                delta({"reasoningContent": {"text": "plan"}}),
+                delta({"reasoningContent": {"signature": "sig"}}),
+                delta({"text": '{"city": "Seoul"}'}),
+                {"messageStop": {"stopReason": "end_turn"}},
+            ]
+        )
+    }
+    lines = [line for line in chat(client, stream=True, response_format=JSON_SCHEMA_FORMAT).text.splitlines()]
+    chunks = [json.loads(line[6:]) for line in lines if line.startswith("data: {")]
+    content = "".join(chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks if chunk["choices"])
+    assert json.loads(content) == {"city": "Seoul"}

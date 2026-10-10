@@ -36,6 +36,7 @@ from api.schema import (
     ErrorMessage,
     Function,
     ImageContent,
+    JsonSchemaFormat,
     PromptTokensDetails,
     ResponseFunction,
     TextContent,
@@ -120,6 +121,18 @@ profile_models: dict[str, str] = {}
 
 # Bedrock rejects Claude thinking budgets below this value
 MIN_THINKING_BUDGET_TOKENS = 1024
+
+# Added to the system prompt for response_format json_object, which Converse cannot enforce.
+JSON_OBJECT_INSTRUCTION = "Respond with a single valid JSON object and no other text."
+
+
+def _json_format(chat_request: ChatRequest) -> str | None:
+    """The requested JSON response format ("json_object" or "json_schema"), if any."""
+    response_format = chat_request.response_format
+    if response_format and response_format.type in ("json_object", "json_schema"):
+        return response_format.type
+    return None
+
 
 # A leading reasoning block, in the format the gateway returns reasoning in.
 _THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>", re.DOTALL)
@@ -229,6 +242,8 @@ class BedrockModel(BaseChatModel):
         self.think_emitted = False
         self.tool_call_indexes: dict[int, int] = {}
         self.reasoning_tokens = 0
+        # Reasoning is returned as <think> text unless that would break a JSON response.
+        self.reasoning_in_content = True
 
     def list_models(self) -> list[str]:
         """Always refresh the latest model list"""
@@ -263,6 +278,7 @@ class BedrockModel(BaseChatModel):
         """Convert the request and call Converse, mapping Bedrock errors to HTTP errors."""
         if DEBUG:
             logger.info("Raw request: %s", chat_request.model_dump_json())
+        self.reasoning_in_content = _json_format(chat_request) is None
 
         # Converting the request can fetch remote images, so it runs in the thread pool.
         try:
@@ -387,6 +403,10 @@ class BedrockModel(BaseChatModel):
             # Converse rejects an empty system text block.
             if text.strip():
                 system_prompts.append({"text": text})
+
+        if _json_format(chat_request) == "json_object":
+            # Converse cannot constrain output to an arbitrary JSON object, only to a schema.
+            system_prompts.append({"text": JSON_OBJECT_INSTRUCTION})
 
         if system_prompts and self._cache_enabled(chat_request, "system"):
             system_prompts.append({"cachePoint": {"type": "default"}})
@@ -526,12 +546,8 @@ class BedrockModel(BaseChatModel):
                 [chat_request.stop] if isinstance(chat_request.stop, str) else chat_request.stop
             )
 
-        if chat_request.response_format and chat_request.response_format.get("type") not in (None, "text"):
-            logger.warning(
-                "response_format %s is not supported and is ignored for %s",
-                chat_request.response_format.get("type"),
-                chat_request.model,
-            )
+        if _json_format(chat_request) == "json_schema":
+            args["outputConfig"] = self._output_config(chat_request.response_format.json_schema)
 
         additional_fields = self._reasoning_fields(chat_request, rules, max_tokens)
         if chat_request.extra_body:
@@ -566,6 +582,20 @@ class BedrockModel(BaseChatModel):
                 tool_config["toolChoice"] = tool_choice
             args["toolConfig"] = tool_config
         return args
+
+    @staticmethod
+    def _output_config(json_schema: JsonSchemaFormat | None) -> dict:
+        """Translate an OpenAI json_schema response format to a Converse outputConfig.
+
+        Models without structured outputs reject it with a ValidationException.
+        See: https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html
+        """
+        if json_schema is None:
+            raise HTTPException(status_code=400, detail="response_format json_schema requires a json_schema object")
+        definition = {"schema": json.dumps(json_schema.schema_), "name": json_schema.name}
+        if json_schema.description:
+            definition["description"] = json_schema.description
+        return {"textFormat": {"type": "json_schema", "structure": {"jsonSchema": definition}}}
 
     def _reasoning_fields(self, chat_request: ChatRequest, rules: ModelRules, max_tokens: int | None) -> dict:
         """Translate reasoning_effort into the model's additionalModelRequestFields."""
@@ -644,7 +674,8 @@ class BedrockModel(BaseChatModel):
         text = "".join(text_parts)
         reasoning = "".join(reasoning_parts)
         if reasoning:
-            text = f"<think>{reasoning}</think>{text}"
+            if self.reasoning_in_content:
+                text = f"<think>{reasoning}</think>{text}"
             usage.completion_tokens_details = CompletionTokensDetails(
                 reasoning_tokens=len(ENCODER.encode(reasoning)), audio_tokens=0
             )
@@ -727,6 +758,8 @@ class BedrockModel(BaseChatModel):
                 if "text" in delta["reasoningContent"]:
                     content = delta["reasoningContent"]["text"]
                     self.reasoning_tokens += len(ENCODER.encode(content))
+                    if not self.reasoning_in_content:
+                        return None
                     if not self.think_emitted:
                         # Start of reasoning content
                         content = "<think>" + content
