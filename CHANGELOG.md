@@ -5,6 +5,8 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 ## Unreleased
 
 ### Added
+- Client `cache_control` markers (on text parts, tool message parts and tools) place the cache points, instead of
+  the gateway's system and last-user-message points.
 - `PROMPT_CACHE_TTL` (stack parameter `PromptCacheTtl`): one-hour cache points on Claude 4.5 and later, or per
   request with `extra_body.prompt_caching.ttl`. Usage reports cache writes as
   `prompt_tokens_details.cache_write_tokens`.
