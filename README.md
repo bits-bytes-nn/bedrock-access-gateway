@@ -134,6 +134,7 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
    - **DefaultModelId**: (Optional) Model used for OpenAI model names such as `gpt-4o` (default `global.anthropic.claude-opus-5-5`)
    - **DefaultEmbeddingModelId**: (Optional) Model used for OpenAI embedding model names such as `text-embedding-3-small` (default `amazon.titan-embed-text-v2:0`)
    - **EnablePromptCaching**: (Optional) Add cache points for models that support prompt caching
+   - **PromptCacheTtl**: (Optional) `5m` (default) or `1h` cache points on Claude 4.5 and later
    - **EnableImageUrlFetch**, **ImageUrlAllowedHosts**: (Optional) Controls for remote image URLs, see the [Security Guide](./docs/Security.md)
    - **LogRetentionInDays**: (Optional) How long the logs are kept (default 90)
    - **ThrottlingRateLimit**, **ThrottlingBurstLimit** (Lambda template only): (Optional) Requests per second and
@@ -309,7 +310,8 @@ curl $OPENAI_BASE_URL/chat/completions \
 - `"prompt_caching": {"system": true}` - Cache system prompts
 - `"prompt_caching": {"messages": true}` - Cache user messages
 - `"prompt_caching": {"system": true, "messages": true}` - Cache both
-- `"prompt_caching": {"ttl": "1h"}` - Keep this request's cache points for an hour (or `"5m"`), overriding `PROMPT_CACHE_TTL`
+- `"prompt_caching": {"ttl": "1h"}` - Keep this request's cache points for an hour (or `"5m"`), overriding
+  `PROMPT_CACHE_TTL`. It does not turn caching on by itself, and a model without the one-hour TTL gets the default
 
 **Requirements:**
 - A prompt prefix shorter than the model's minimum (1,024 tokens for most Claude models) is not cached

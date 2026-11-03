@@ -5,6 +5,9 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 ## Unreleased
 
 ### Added
+- `PROMPT_CACHE_TTL` (stack parameter `PromptCacheTtl`): one-hour cache points on Claude 4.5 and later, or per
+  request with `extra_body.prompt_caching.ttl`. Usage reports cache writes as
+  `prompt_tokens_details.cache_write_tokens`.
 - `response_format` `json_schema` is sent to Bedrock as structured outputs (`outputConfig.textFormat`);
   `json_object` adds a JSON instruction to the system prompt. JSON responses carry no `<think>` block.
 - Fargate template: optional HTTPS listener (`CertificateArn`) with HTTP redirected to HTTPS, container logs in

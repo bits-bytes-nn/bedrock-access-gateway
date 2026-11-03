@@ -609,8 +609,9 @@ def test_images_in_chat_are_sent_as_image_blocks(client, runtime, monkeypatch):
         (CHAT_MODEL, "1h", {"prompt_caching": {"ttl": "5m"}}, None),
         (CHAT_MODEL, "5m", {"prompt_caching": {"ttl": "1h"}}, "1h"),
         (CHAT_MODEL, "1h", {"prompt_caching": {"ttl": "1d"}}, "1h"),  # an unknown TTL keeps the setting
-        # Claude 3.7 Sonnet caches, but only with the default TTL.
+        # Claude 3.7 Sonnet and Nova cache, but only with the default TTL.
         ("us.anthropic.claude-3-7-sonnet-20250219-v1:0", "1h", None, None),
+        ("amazon.nova-pro-v1:0", "1h", None, None),
     ],
 )
 def test_cache_point_ttl(client, runtime, monkeypatch, model, default_ttl, extra_body, expected):
@@ -671,6 +672,22 @@ def test_stream_usage_chunk_only_when_requested(client, runtime, stream_options,
     assert bool(usage_chunks) is expect_usage
     content_chunks = [json.loads(line[6:]) for line in lines if json.loads(line[6:])["choices"]]
     assert all("usage" in chunk and chunk["usage"] is None for chunk in content_chunks)
+
+
+def test_stream_usage_chunk_reports_cache_writes_alone(client, runtime):
+    usage = {"inputTokens": 3, "outputTokens": 1, "totalTokens": 34, "cacheWriteInputTokens": 30}
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "ok"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": usage}},
+    ]
+    runtime.converse_stream.return_value = {"stream": iter(events)}
+    response = chat(client, stream=True, stream_options={"include_usage": True})
+    lines = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+    final = next(chunk for chunk in lines if chunk["choices"] == [])["usage"]
+    assert final["prompt_tokens"] == 33
+    assert final["prompt_tokens_details"] == {"cached_tokens": 0, "cache_write_tokens": 30, "audio_tokens": 0}
 
 
 @pytest.mark.parametrize(
