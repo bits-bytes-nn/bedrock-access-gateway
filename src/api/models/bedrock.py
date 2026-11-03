@@ -393,36 +393,62 @@ class BedrockModel(BaseChatModel):
             return prompt_caching[key] is True
         return ENABLE_PROMPT_CACHING
 
-    def _cache_point(self, chat_request: ChatRequest) -> dict:
-        """A cache point with the TTL asked for: extra_body.prompt_caching.ttl ("5m" or "1h")
-        overrides PROMPT_CACHE_TTL. The default TTL is sent as no TTL, as before."""
+    def _cache_point(self, chat_request: ChatRequest, marker: dict | None = None) -> dict:
+        """A cache point with the TTL asked for: a client marker's ttl, else
+        extra_body.prompt_caching.ttl ("5m" or "1h"), else PROMPT_CACHE_TTL. The default
+        TTL is sent as no TTL, as before."""
         prompt_caching = (chat_request.extra_body or {}).get("prompt_caching")
-        ttl = prompt_caching.get("ttl") if isinstance(prompt_caching, dict) else None
+        ttl = (marker or {}).get("ttl")
+        if ttl not in ("5m", "1h"):
+            ttl = prompt_caching.get("ttl") if isinstance(prompt_caching, dict) else None
         ttl = ttl if ttl in ("5m", "1h") else PROMPT_CACHE_TTL
         point = {"type": "default"}
         if ttl == "1h" and self._rules(chat_request.model).long_cache_ttl:
             point["ttl"] = "1h"
         return {"cachePoint": point}
 
+    def _client_cache_marks(self, chat_request: ChatRequest) -> bool:
+        """Whether the client marked where cached prefixes end (`cache_control` on a text
+        part, a tool message part or a tool), for a model that caches. Then those marks are
+        the cache points: the client knows which parts stay put between calls (a context
+        note re-sent at the end of every request would move a point put on the last user
+        message, and every call would miss the history cached before it)."""
+        if not self._rules(chat_request.model).prompt_caching:
+            return False
+        if any(tool.cache_control for tool in chat_request.tools or []):
+            return True
+        for message in chat_request.messages:
+            for part in message.content if isinstance(message.content, list) else []:
+                marker = part.get("cache_control") if isinstance(part, dict) else getattr(part, "cache_control", None)
+                if marker:
+                    return True
+        return False
+
     def _parse_system_prompts(self, chat_request: ChatRequest) -> list[dict]:
         """Collect system and developer messages as Converse system blocks."""
+        marked = self._client_cache_marks(chat_request)
         system_prompts = []
         for message in chat_request.messages:
             if message.role not in ("system", "developer"):
                 continue
             if isinstance(message.content, str):
-                text = message.content
+                parts = [TextContent(text=message.content)]
+            elif marked:  # kept apart: a marked part ends a cached prefix, the rest follows it
+                parts = message.content
             else:
-                text = "\n".join(part.text for part in message.content)
-            # Converse rejects an empty system text block.
-            if text.strip():
-                system_prompts.append({"text": text})
+                parts = [TextContent(text="\n".join(part.text for part in message.content))]
+            for part in parts:
+                # Converse rejects an empty system text block.
+                if part.text.strip():
+                    system_prompts.append({"text": part.text})
+                if marked and part.cache_control and system_prompts:
+                    system_prompts.append(self._cache_point(chat_request, part.cache_control))
 
         if _json_format(chat_request) == "json_object":
             # Converse cannot constrain output to an arbitrary JSON object, only to a schema.
             system_prompts.append({"text": JSON_OBJECT_INSTRUCTION})
 
-        if system_prompts and self._cache_enabled(chat_request, "system"):
+        if system_prompts and not marked and self._cache_enabled(chat_request, "system"):
             system_prompts.append(self._cache_point(chat_request))
         return system_prompts
 
@@ -432,12 +458,17 @@ class BedrockModel(BaseChatModel):
         See: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
         """
         messages = []
+        point = (
+            (lambda marker: self._cache_point(chat_request, marker)) if self._client_cache_marks(chat_request) else None
+        )
         for message in chat_request.messages:
             if isinstance(message, UserMessage):
-                messages.append({"role": "user", "content": self._parse_content_parts(message, chat_request.model)})
+                messages.append(
+                    {"role": "user", "content": self._parse_content_parts(message, chat_request.model, point)}
+                )
             elif isinstance(message, AssistantMessage):
                 # Converse rejects blank text blocks, so empty assistant text is left out.
-                content = self._parse_content_parts(message, chat_request.model) if message.content else []
+                content = self._parse_content_parts(message, chat_request.model, point) if message.content else []
                 for tool_call in message.tool_calls or []:
                     arguments = tool_call.function.arguments
                     tool_input = json.loads(arguments) if arguments and arguments.strip() else {}
@@ -449,12 +480,19 @@ class BedrockModel(BaseChatModel):
             elif isinstance(message, ToolMessage):
                 # Converse has no tool role; results go back as toolResult blocks in a user turn.
                 tool_content = self._tool_result_content(message.content, chat_request.model)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [{"toolResult": {"toolUseId": message.tool_call_id, "content": tool_content}}],
-                    }
+                content = [{"toolResult": {"toolUseId": message.tool_call_id, "content": tool_content}}]
+                # A cache point cannot sit inside a tool result: a marked part ends the prefix after it.
+                marker = (
+                    next(
+                        (p["cache_control"] for p in message.content if isinstance(p, dict) and p.get("cache_control")),
+                        None,
+                    )
+                    if isinstance(message.content, list)
+                    else None
                 )
+                if point and marker:
+                    content.append(point(marker))
+                messages.append({"role": "user", "content": content})
         return self._merge_consecutive_roles(messages, chat_request)
 
     @staticmethod
@@ -516,7 +554,7 @@ class BedrockModel(BaseChatModel):
                 {"role": "user", "content": [{"text": "Please continue your response from where you left off."}]}
             )
 
-        if merged and self._cache_enabled(chat_request, "messages"):
+        if merged and not self._client_cache_marks(chat_request) and self._cache_enabled(chat_request, "messages"):
             last_user = next((message for message in reversed(merged) if message["role"] == "user"), None)
             if last_user:
                 last_user["content"].append(self._cache_point(chat_request))
@@ -586,7 +624,12 @@ class BedrockModel(BaseChatModel):
         # Bedrock requires the tool config whenever the history contains tool blocks.
         skip_tools = chat_request.tool_choice == "none" and not self._has_tool_blocks(messages)
         if chat_request.tools and not skip_tools:
-            tool_config = {"tools": [self._convert_tool_spec(t.function) for t in chat_request.tools]}
+            tool_config = {"tools": []}
+            marked = self._client_cache_marks(chat_request)
+            for tool in chat_request.tools:
+                tool_config["tools"].append(self._convert_tool_spec(tool.function))
+                if marked and tool.cache_control:
+                    tool_config["tools"].append(self._cache_point(chat_request, tool.cache_control))
             # Some models reject toolChoice; "none" cannot be expressed, so it falls back to auto.
             if chat_request.tool_choice and chat_request.tool_choice != "none" and rules.tool_choice:
                 tool_choice = self._convert_tool_choice(chat_request.tool_choice)
@@ -841,7 +884,9 @@ class BedrockModel(BaseChatModel):
         self.think_emitted = False
         return "</think>"
 
-    def _parse_content_parts(self, message: UserMessage | AssistantMessage, model_id: str) -> list[dict]:
+    def _parse_content_parts(self, message: UserMessage | AssistantMessage, model_id: str, point=None) -> list[dict]:
+        """Converse blocks of a message; with `point` (the client marked cache points), a
+        cache point follows each part that carries a `cache_control` marker."""
         parts = [TextContent(text=message.content)] if isinstance(message.content, str) else message.content
         content_parts = []
         for part in parts:
@@ -853,6 +898,8 @@ class BedrockModel(BaseChatModel):
                 # Converse rejects blank text blocks.
                 if text.strip():
                     content_parts.append({"text": text})
+                if point and part.cache_control and content_parts:
+                    content_parts.append(point(part.cache_control))
             elif isinstance(part, ImageContent):
                 content_parts.append(self._image_block(part.image_url.url, model_id))
         if not content_parts and isinstance(message, UserMessage):

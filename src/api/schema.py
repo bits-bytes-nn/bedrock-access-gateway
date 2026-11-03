@@ -33,6 +33,9 @@ class ToolCall(BaseModel):
 class TextContent(BaseModel):
     type: Literal["text"] = "text"
     text: str
+    # Anthropic-style prompt cache marker ({"type": "ephemeral", "ttl"?: "5m" | "1h"}),
+    # which some clients put on the block a cached prefix should end at.
+    cache_control: dict | None = None
 
 
 class ImageUrl(BaseModel):
@@ -86,6 +89,7 @@ class Function(BaseModel):
 class Tool(BaseModel):
     type: Literal["function"] = "function"
     function: Function
+    cache_control: dict | None = None
 
 
 class StreamOptions(BaseModel):

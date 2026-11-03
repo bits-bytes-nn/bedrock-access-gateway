@@ -628,6 +628,51 @@ def test_cache_point_ttl(client, runtime, monkeypatch, model, default_ttl, extra
     assert all(p.get("ttl") == expected for p in points)
 
 
+def test_client_cache_marks_place_the_cache_points(client, runtime, monkeypatch):
+    """A client that marks its stable prefix ends (OpenClaw's cacheControlFormat "anthropic")
+    gets points there and nowhere else: not after the dynamic system tail, and not after a
+    note re-sent at the end of every request, which would make every call miss."""
+    monkeypatch.setattr(bedrock_module, "ENABLE_PROMPT_CACHING", True)
+    monkeypatch.setattr(bedrock_module, "PROMPT_CACHE_TTL", "1h")
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, CHAT_MODEL, {"modalities": ["TEXT"]})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    mark = {"type": "ephemeral"}
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "stable", "cache_control": mark}, {"type": "text", "text": "dynamic"}],
+        },
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": [{"type": "text", "text": "out", "cache_control": mark}]},
+        {"role": "user", "content": "context note"},
+    ]
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}, "cache_control": mark}]
+    assert chat(client, messages=messages, tools=tools).status_code == 200
+    args = sent_args(runtime)
+    assert args["system"] == [{"text": "stable"}, {"cachePoint": {"type": "default", "ttl": "1h"}}, {"text": "dynamic"}]
+    last = args["messages"][-1]["content"]
+    assert [next(iter(b)) for b in last] == ["toolResult", "cachePoint", "text"]
+    assert args["toolConfig"]["tools"][-1] == {"cachePoint": {"type": "default", "ttl": "1h"}}
+    points = [b for m in args["messages"] for b in m["content"] if "cachePoint" in b]
+    assert len(points) == 1
+
+
+def test_client_cache_marks_ignored_for_models_without_caching(client, runtime, monkeypatch):
+    model = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, model, {"modalities": ["TEXT"]})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]},
+    ]
+    assert chat(client, model=model, messages=messages).status_code == 200
+    assert cache_points(sent_args(runtime)) == (0, 0)
+
+
 # --- responses: usage, finish reasons, errors ---------------------------------------
 
 

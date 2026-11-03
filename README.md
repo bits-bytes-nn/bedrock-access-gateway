@@ -318,6 +318,10 @@ curl $OPENAI_BASE_URL/chat/completions \
 - Cache TTL is 5 minutes (resets on each cache hit), or one hour with the `PromptCacheTtl` stack parameter
   (`PROMPT_CACHE_TTL=1h`) on Claude 4.5 and later. A one-hour write costs 2x the input price instead of 1.25x,
   so it pays off when a conversation pauses for more than five minutes
+- A client can mark the cache points itself with Anthropic-style `cache_control` on text parts, tool message
+  parts and tools (OpenClaw's `cacheControlFormat: "anthropic"`). The gateway then puts a cache point right after
+  each marked part and adds none of its own; the marker's `ttl` overrides the TTL setting. Clients that re-send a
+  note at the end of every request should do this: a point on the last user message would move every call
 - Usage reports cache reads as `prompt_tokens_details.cached_tokens` and cache writes as
   `prompt_tokens_details.cache_write_tokens`; both are part of `prompt_tokens`
 - See the guide below for the per-model minimums and limits
