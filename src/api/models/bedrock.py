@@ -413,14 +413,14 @@ class BedrockModel(BaseChatModel):
         the cache points: the client knows which parts stay put between calls (a context
         note re-sent at the end of every request would move a point put on the last user
         message, and every call would miss the history cached before it)."""
-        if not self._rules(chat_request.model).prompt_caching:
-            return False
+        if not (self._cache_enabled(chat_request, "system") or self._cache_enabled(chat_request, "messages")):
+            return False  # caching off (the setting or the request's prompt_caching): no points at all
         if any(tool.cache_control for tool in chat_request.tools or []):
             return True
         for message in chat_request.messages:
             for part in message.content if isinstance(message.content, list) else []:
                 marker = part.get("cache_control") if isinstance(part, dict) else getattr(part, "cache_control", None)
-                if marker:
+                if isinstance(marker, dict):
                     return True
         return False
 
@@ -441,7 +441,7 @@ class BedrockModel(BaseChatModel):
                 # Converse rejects an empty system text block.
                 if part.text.strip():
                     system_prompts.append({"text": part.text})
-                if marked and part.cache_control and system_prompts:
+                if marked and part.cache_control and system_prompts and "cachePoint" not in system_prompts[-1]:
                     system_prompts.append(self._cache_point(chat_request, part.cache_control))
 
         if _json_format(chat_request) == "json_object":
@@ -484,7 +484,11 @@ class BedrockModel(BaseChatModel):
                 # A cache point cannot sit inside a tool result: a marked part ends the prefix after it.
                 marker = (
                     next(
-                        (p["cache_control"] for p in message.content if isinstance(p, dict) and p.get("cache_control")),
+                        (
+                            p["cache_control"]
+                            for p in message.content
+                            if isinstance(p, dict) and isinstance(p.get("cache_control"), dict)
+                        ),
                         None,
                     )
                     if isinstance(message.content, list)
@@ -898,7 +902,7 @@ class BedrockModel(BaseChatModel):
                 # Converse rejects blank text blocks.
                 if text.strip():
                     content_parts.append({"text": text})
-                if point and part.cache_control and content_parts:
+                if point and part.cache_control and content_parts and "cachePoint" not in content_parts[-1]:
                     content_parts.append(point(part.cache_control))
             elif isinstance(part, ImageContent):
                 content_parts.append(self._image_block(part.image_url.url, model_id))

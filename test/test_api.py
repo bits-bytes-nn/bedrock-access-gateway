@@ -661,6 +661,28 @@ def test_client_cache_marks_place_the_cache_points(client, runtime, monkeypatch)
     assert len(points) == 1
 
 
+def test_client_cache_marks_follow_the_caching_switch(client, runtime, monkeypatch):
+    monkeypatch.setattr(bedrock_module, "ENABLE_PROMPT_CACHING", False)
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, CHAT_MODEL, {"modalities": ["TEXT"]})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    mark = {"type": "ephemeral"}
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "s", "cache_control": mark}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a", "cache_control": mark},
+                {"type": "text", "text": " ", "cache_control": mark},
+            ],
+        },
+    ]
+    assert chat(client, messages=messages).status_code == 200
+    assert cache_points(sent_args(runtime)) == (0, 0)
+    monkeypatch.setattr(bedrock_module, "ENABLE_PROMPT_CACHING", True)
+    assert chat(client, messages=messages).status_code == 200
+    assert cache_points(sent_args(runtime)) == (1, 1)  # a blank marked part adds no second point
+
+
 def test_client_cache_marks_ignored_for_models_without_caching(client, runtime, monkeypatch):
     model = "apac.anthropic.claude-3-haiku-20240307-v1:0"
     monkeypatch.setitem(bedrock_module.bedrock_model_list, model, {"modalities": ["TEXT"]})

@@ -321,7 +321,10 @@ curl $OPENAI_BASE_URL/chat/completions \
 - A client can mark the cache points itself with Anthropic-style `cache_control` on text parts, tool message
   parts and tools (OpenClaw's `cacheControlFormat: "anthropic"`). The gateway then puts a cache point right after
   each marked part and adds none of its own; the marker's `ttl` overrides the TTL setting. Clients that re-send a
-  note at the end of every request should do this: a point on the last user message would move every call
+  note at the end of every request should do this: a point on the last user message would move every call.
+  Markers are followed only while caching is on (`ENABLE_PROMPT_CACHING` or the request's `prompt_caching`); a
+  request with markers gets no automatic points, so mark the system prompt too. Send a mid-conversation note as a
+  user message, not a developer one: developer messages are moved into the system prompt, ahead of the history
 - Usage reports cache reads as `prompt_tokens_details.cached_tokens` and cache writes as
   `prompt_tokens_details.cache_write_tokens`; both are part of `prompt_tokens`
 - See the guide below for the per-model minimums and limits
