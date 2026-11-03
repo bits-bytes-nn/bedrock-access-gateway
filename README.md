@@ -309,10 +309,15 @@ curl $OPENAI_BASE_URL/chat/completions \
 - `"prompt_caching": {"system": true}` - Cache system prompts
 - `"prompt_caching": {"messages": true}` - Cache user messages
 - `"prompt_caching": {"system": true, "messages": true}` - Cache both
+- `"prompt_caching": {"ttl": "1h"}` - Keep this request's cache points for an hour (or `"5m"`), overriding `PROMPT_CACHE_TTL`
 
 **Requirements:**
 - A prompt prefix shorter than the model's minimum (1,024 tokens for most Claude models) is not cached
-- Cache TTL is 5 minutes (resets on each cache hit)
+- Cache TTL is 5 minutes (resets on each cache hit), or one hour with the `PromptCacheTtl` stack parameter
+  (`PROMPT_CACHE_TTL=1h`) on Claude 4.5 and later. A one-hour write costs 2x the input price instead of 1.25x,
+  so it pays off when a conversation pauses for more than five minutes
+- Usage reports cache reads as `prompt_tokens_details.cached_tokens` and cache writes as
+  `prompt_tokens_details.cache_write_tokens`; both are part of `prompt_tokens`
 - See the guide below for the per-model minimums and limits
 
 For more information, see the [Amazon Bedrock Prompt Caching Guide](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
@@ -443,6 +448,7 @@ The application reads these environment variables. The Lambda template sets them
 | `ENABLE_CROSS_REGION_INFERENCE` | `true` | List system-defined inference profiles as models |
 | `ENABLE_APPLICATION_INFERENCE_PROFILES` | `true` | List application inference profiles as models |
 | `ENABLE_PROMPT_CACHING` | `false` | Add cache points for models that support prompt caching |
+| `PROMPT_CACHE_TTL` | `5m` | Cache point TTL, `5m` or `1h` (Claude 4.5 and later) |
 | `ENABLE_IMAGE_URL_FETCH` | `true` | Allow remote http(s) image URLs |
 | `IMAGE_URL_ALLOWED_HOSTS` | | Comma-separated hosts remote image URLs may point at |
 | `IMAGE_URL_MAX_SIZE_MB` | `10` | Maximum size of a fetched image |

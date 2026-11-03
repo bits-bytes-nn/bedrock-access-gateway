@@ -52,6 +52,8 @@ class ModelRules:
     # Whether toolChoice may force a tool ("any" or a named tool).
     forced_tool_choice: bool = True
     prompt_caching: bool = False
+    # Whether a cache point may ask for the one-hour TTL (Claude 4.5 and later).
+    long_cache_ttl: bool = False
 
 
 # Current naming: anthropic.claude-opus-4-5-20251101-v1:0, anthropic.claude-sonnet-5-5,
@@ -96,6 +98,7 @@ def _claude_rules(family: str, version: tuple[int, int]) -> ModelRules:
         forced_tool_choice=forced_tool_choice,
         # Prompt caching starts with Claude 3.7 Sonnet and 3.5 Haiku.
         prompt_caching=version >= (3, 7) or (family == "haiku" and version == (3, 5)),
+        long_cache_ttl=version >= (4, 5),
     )
 
 

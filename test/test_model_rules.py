@@ -70,3 +70,17 @@ def test_date_suffix_is_not_read_as_a_minor_version():
 )
 def test_other_providers(model_id, expected):
     assert rules_for(model_id) == expected
+
+
+@pytest.mark.parametrize(
+    "model_id,long_ttl",
+    [
+        ("global.anthropic.claude-opus-5-5", True),
+        ("global.anthropic.claude-haiku-4-5-20251001-v1:0", True),
+        ("us.anthropic.claude-sonnet-4-20250514-v1:0", False),
+        ("us.anthropic.claude-3-7-sonnet-20250219-v1:0", False),
+        ("amazon.nova-pro-v1:0", False),
+    ],
+)
+def test_one_hour_cache_ttl_from_claude_4_5(model_id, long_ttl):
+    assert rules_for(model_id).long_cache_ttl is long_ttl

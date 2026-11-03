@@ -601,6 +601,32 @@ def test_images_in_chat_are_sent_as_image_blocks(client, runtime, monkeypatch):
     assert chat(client, messages=[{"role": "user", "content": content}]).status_code == 400
 
 
+@pytest.mark.parametrize(
+    "model,default_ttl,extra_body,expected",
+    [
+        (CHAT_MODEL, "5m", None, None),
+        (CHAT_MODEL, "1h", None, "1h"),
+        (CHAT_MODEL, "1h", {"prompt_caching": {"ttl": "5m"}}, None),
+        (CHAT_MODEL, "5m", {"prompt_caching": {"ttl": "1h"}}, "1h"),
+        (CHAT_MODEL, "1h", {"prompt_caching": {"ttl": "1d"}}, "1h"),  # an unknown TTL keeps the setting
+        # Claude 3.7 Sonnet caches, but only with the default TTL.
+        ("us.anthropic.claude-3-7-sonnet-20250219-v1:0", "1h", None, None),
+    ],
+)
+def test_cache_point_ttl(client, runtime, monkeypatch, model, default_ttl, extra_body, expected):
+    monkeypatch.setattr(bedrock_module, "ENABLE_PROMPT_CACHING", True)
+    monkeypatch.setattr(bedrock_module, "PROMPT_CACHE_TTL", default_ttl)
+    monkeypatch.setitem(bedrock_module.bedrock_model_list, model, {"modalities": ["TEXT"]})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    assert chat(client, model=model, messages=SYSTEM_AND_USER, extra_body=extra_body).status_code == 200
+    args = sent_args(runtime)
+    points = [b["cachePoint"] for b in args["system"] if "cachePoint" in b] + [
+        b["cachePoint"] for m in args["messages"] for b in m["content"] if "cachePoint" in b
+    ]
+    assert len(points) == 2
+    assert all(p.get("ttl") == expected for p in points)
+
+
 # --- responses: usage, finish reasons, errors ---------------------------------------
 
 
@@ -614,6 +640,20 @@ def test_usage_counts_cached_tokens(client, runtime):
         2,
         20,
     )
+
+
+def test_usage_reports_cache_writes(client, runtime):
+    result = converse_result([{"text": "ok"}])
+    result["usage"] = {
+        "inputTokens": 3,
+        "outputTokens": 2,
+        "totalTokens": 45,
+        "cacheReadInputTokens": 20,
+        "cacheWriteInputTokens": 20,
+    }
+    runtime.converse.return_value = result
+    details = chat(client).json()["usage"]["prompt_tokens_details"]
+    assert (details["cached_tokens"], details["cache_write_tokens"]) == (20, 20)
 
 
 @pytest.mark.parametrize("stream_options,expect_usage", [({"include_usage": True}, True), ({}, False), (None, False)])

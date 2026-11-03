@@ -39,6 +39,13 @@ Parameters:
       - "true"
       - "false"
     Description: Enable prompt caching for supported models (Claude, Nova). When enabled, adds cachePoint to system prompts and messages for cost savings.
+  PromptCacheTtl:
+    Type: String
+    Default: "5m"
+    AllowedValues:
+      - "5m"
+      - "1h"
+    Description: How long a cache point keeps the prompt prefix. "1h" costs more to write (2x input instead of 1.25x) and pays off when conversations pause for more than five minutes. Applies to Claude 4.5 and later; other models keep the default.
   ThrottlingRateLimit:
     Type: Number
     Default: 10
@@ -121,6 +128,7 @@ Resources:
           ENABLE_CROSS_REGION_INFERENCE: "true"
           ENABLE_APPLICATION_INFERENCE_PROFILES: "true"
           ENABLE_PROMPT_CACHING: !Ref EnablePromptCaching
+          PROMPT_CACHE_TTL: !Ref PromptCacheTtl
           ENABLE_IMAGE_URL_FETCH: !Ref EnableImageUrlFetch
           IMAGE_URL_ALLOWED_HOSTS: !Ref ImageUrlAllowedHosts
           API_ROUTE_PREFIX: /v1

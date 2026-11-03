@@ -45,6 +45,12 @@ DEFAULT_EMBEDDING_MODEL = os.environ.get("DEFAULT_EMBEDDING_MODEL", "amazon.tita
 ENABLE_CROSS_REGION_INFERENCE = _env_flag("ENABLE_CROSS_REGION_INFERENCE", True)
 ENABLE_APPLICATION_INFERENCE_PROFILES = _env_flag("ENABLE_APPLICATION_INFERENCE_PROFILES", True)
 ENABLE_PROMPT_CACHING = _env_flag("ENABLE_PROMPT_CACHING", False)
+# How long a cache point keeps the prefix: "5m" (Bedrock's default) or "1h", which costs more
+# to write and pays off when a conversation pauses for more than five minutes. Models without
+# the one-hour TTL always get the default.
+PROMPT_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "5m").strip() or "5m"
+if PROMPT_CACHE_TTL not in {"5m", "1h"}:
+    raise RuntimeError(f"PROMPT_CACHE_TTL must be 5m or 1h, got {PROMPT_CACHE_TTL!r}")
 
 # Multimodal image inputs may reference a remote URL that the gateway fetches on
 # behalf of the caller. See api/image_url.py for the checks applied to that URL.

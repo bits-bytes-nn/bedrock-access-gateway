@@ -134,6 +134,9 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens usage, following OpenAI API format."""
 
     cached_tokens: int = 0
+    # Not in OpenAI's schema: the part of prompt_tokens written to the prompt cache, which
+    # is priced apart from plain input (clients that price usage read it, others ignore it).
+    cache_write_tokens: int = 0
     audio_tokens: int = 0
 
 

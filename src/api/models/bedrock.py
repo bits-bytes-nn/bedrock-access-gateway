@@ -52,6 +52,7 @@ from api.setting import (
     ENABLE_APPLICATION_INFERENCE_PROFILES,
     ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_PROMPT_CACHING,
+    PROMPT_CACHE_TTL,
 )
 
 logger = logging.getLogger(__name__)
@@ -321,7 +322,9 @@ class BedrockModel(BaseChatModel):
             completion_tokens=usage["outputTokens"],
             total_tokens=usage["totalTokens"],
             prompt_tokens_details=(
-                PromptTokensDetails(cached_tokens=cache_read_tokens, audio_tokens=0)
+                PromptTokensDetails(
+                    cached_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens, audio_tokens=0
+                )
                 if cache_read_tokens or cache_write_tokens
                 else None
             ),
@@ -390,6 +393,17 @@ class BedrockModel(BaseChatModel):
             return prompt_caching[key] is True
         return ENABLE_PROMPT_CACHING
 
+    def _cache_point(self, chat_request: ChatRequest) -> dict:
+        """A cache point with the TTL asked for: extra_body.prompt_caching.ttl ("5m" or "1h")
+        overrides PROMPT_CACHE_TTL. The default TTL is sent as no TTL, as before."""
+        prompt_caching = (chat_request.extra_body or {}).get("prompt_caching")
+        ttl = prompt_caching.get("ttl") if isinstance(prompt_caching, dict) else None
+        ttl = ttl if ttl in ("5m", "1h") else PROMPT_CACHE_TTL
+        point = {"type": "default"}
+        if ttl == "1h" and self._rules(chat_request.model).long_cache_ttl:
+            point["ttl"] = "1h"
+        return {"cachePoint": point}
+
     def _parse_system_prompts(self, chat_request: ChatRequest) -> list[dict]:
         """Collect system and developer messages as Converse system blocks."""
         system_prompts = []
@@ -409,7 +423,7 @@ class BedrockModel(BaseChatModel):
             system_prompts.append({"text": JSON_OBJECT_INSTRUCTION})
 
         if system_prompts and self._cache_enabled(chat_request, "system"):
-            system_prompts.append({"cachePoint": {"type": "default"}})
+            system_prompts.append(self._cache_point(chat_request))
         return system_prompts
 
     def _parse_messages(self, chat_request: ChatRequest) -> list[dict]:
@@ -505,7 +519,7 @@ class BedrockModel(BaseChatModel):
         if merged and self._cache_enabled(chat_request, "messages"):
             last_user = next((message for message in reversed(merged) if message["role"] == "user"), None)
             if last_user:
-                last_user["content"].append({"cachePoint": {"type": "default"}})
+                last_user["content"].append(self._cache_point(chat_request))
         return merged
 
     def _parse_request(self, chat_request: ChatRequest) -> dict:
