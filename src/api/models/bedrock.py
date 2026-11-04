@@ -420,7 +420,7 @@ class BedrockModel(BaseChatModel):
         for message in chat_request.messages:
             for part in message.content if isinstance(message.content, list) else []:
                 marker = part.get("cache_control") if isinstance(part, dict) else getattr(part, "cache_control", None)
-                if isinstance(marker, dict):
+                if isinstance(marker, dict) and marker:
                     return True
         return False
 
