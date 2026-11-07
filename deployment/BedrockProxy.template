@@ -56,6 +56,37 @@ Parameters:
     Default: 20
     MinValue: 1
     Description: Requests the API accepts in a burst above the steady-state rate.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for the alarms below (the address must confirm the SNS subscription). Empty creates no alarms.
+  IdleHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: Alarm when the API has had no Lambda invocation for this many hours in a row (the client stopped calling, e.g. its host is down).
+  SpikeInvocationsPerHour:
+    Type: Number
+    Default: 600
+    MinValue: 1
+    Description: Alarm when Lambda invocations in one hour exceed this (a leaked key or a runaway client).
+  ServerErrorsPerHour:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Alarm when the API returns more than this many 5XX responses in one hour.
+  CostTagKey:
+    Type: String
+    Default: ""
+    Description: Optional tag key on the Lambda role. Bedrock attributes each call to the calling IAM principal, so once activated as a cost allocation tag this tag separates the gateway's Bedrock cost in Cost Explorer. Empty sets no tag.
+  CostTagValue:
+    Type: String
+    Default: ""
+    Description: Value of the CostTagKey tag.
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  HasCostTag: !Not [!Equals [!Ref CostTagKey, ""]]
 Resources:
   # IAM Role for Lambda
   ProxyApiHandlerServiceRole:
@@ -70,6 +101,11 @@ Resources:
         Version: "2012-10-17"
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Tags: !If
+        - HasCostTag
+        - - Key: !Ref CostTagKey
+            Value: !Ref CostTagValue
+        - !Ref AWS::NoValue
 
   ProxyApiHandlerServiceRoleDefaultPolicy:
     Type: AWS::IAM::Policy
@@ -217,6 +253,76 @@ Resources:
           HttpMethod: "*"
           ThrottlingRateLimit: !Ref ThrottlingRateLimit
           ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+
+  # Alarms, sent by email (and their recovery) when AlarmEmail is set.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  IdleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: !Sub "No call reached the gateway for ${IdleHours} hours: its client may be down."
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProxyApiHandler
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: !Ref IdleHours
+      DatapointsToAlarm: !Ref IdleHours
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # An hour without invocations has no data point at all.
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  SpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: !Sub "More than ${SpikeInvocationsPerHour} gateway calls in an hour: a leaked key or a runaway client."
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProxyApiHandler
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref SpikeInvocationsPerHour
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: !Sub "More than ${ServerErrorsPerHour} 5XX responses from the gateway in an hour."
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: BedrockProxyApi
+        - Name: Stage
+          Value: !Ref ApiStage
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref ServerErrorsPerHour
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
 
 Outputs:
   APIBaseUrl:
