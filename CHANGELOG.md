@@ -5,6 +5,10 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 ## Unreleased
 
 ### Added
+- Lambda template: optional email alarms (`AlarmEmail`) for no calls in `IdleHours`, more than
+  `SpikeInvocationsPerHour` calls in an hour and more than `ServerErrorsPerHour` 5XX responses, with recovery
+  notices; optional cost tag on the Lambda role (`CostTagKey`/`CostTagValue`) so Bedrock's IAM principal cost
+  attribution separates the gateway's cost once the tag is activated.
 - Client `cache_control` markers (on text parts, tool message parts and tools) place the cache points, instead of
   the gateway's system and last-user-message points.
 - `PROMPT_CACHE_TTL` (stack parameter `PromptCacheTtl`): one-hour cache points on Claude 4.5 and later, or per
