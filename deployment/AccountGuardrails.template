@@ -1,0 +1,82 @@
+Description: Account-level guardrails for the gateway's account - a monthly cost budget with email alerts, an IAM Access Analyzer for unintended external access, and the API Gateway CloudWatch Logs role that stage access logs need (one per account and Region).
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email that receives the budget alerts.
+  MonthlyBudgetUsd:
+    Type: Number
+    MinValue: 1
+    Description: Monthly cost budget for the whole account in USD. Alerts at 80% and 100% of actual spend and when the month's forecast exceeds it.
+  CreateApiGatewayLogsRole:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create the account's API Gateway CloudWatch Logs role in this Region. Set "false" if another stack already owns AWS::ApiGateway::Account here.
+Conditions:
+  ApiGatewayLogsRole: !Equals [!Ref CreateApiGatewayLogsRole, "true"]
+Resources:
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: ApiGatewayLogsRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: ApiGatewayLogsRole
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: !Sub "${AWS::StackName}-account"
+      Type: ACCOUNT
+
+Outputs:
+  BudgetName:
+    Value: !Ref MonthlyBudget
