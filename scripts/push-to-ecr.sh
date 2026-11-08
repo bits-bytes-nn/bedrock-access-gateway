@@ -25,9 +25,14 @@ LAMBDA_REPO=${LAMBDA_REPO:-bedrock-proxy-api}
 read -r -p "Enter ECR repository name for ECS/Fargate (default: bedrock-proxy-api-ecs): " ECS_REPO
 ECS_REPO=${ECS_REPO:-bedrock-proxy-api-ecs}
 
-# Get image tag
-read -r -p "Enter image tag (default: latest): " TAG
-TAG=${TAG:-latest}
+# Get image tag. The default is unique per build (<commit>-<UTC time>, as in deploy-lambda.sh):
+# a repository with immutable tags, which deploy-lambda.sh sets, rejects a tag pushed before
+# (such as "latest"), and CloudFormation only redeploys when the image URI changes.
+DEFAULT_TAG="$(git rev-parse --short=12 HEAD 2>/dev/null || echo build)"
+[[ -n "$(git status --porcelain 2>/dev/null)" ]] && DEFAULT_TAG="${DEFAULT_TAG}-dirty"
+DEFAULT_TAG="${DEFAULT_TAG}-$(date -u +%Y%m%d%H%M%S)"
+read -r -p "Enter image tag (default: ${DEFAULT_TAG}): " TAG
+TAG=${TAG:-$DEFAULT_TAG}
 
 # Get AWS region
 read -r -p "Enter AWS region (default: us-east-1): " AWS_REGION
