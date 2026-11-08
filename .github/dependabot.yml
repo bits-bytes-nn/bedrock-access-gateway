@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Runtime lock (src/requirements.txt, generated from src/requirements.in) and the dev pins.
+  # After merging a runtime update, regenerate the lock with the uv command in requirements.in
+  # if the update needs new transitive versions.
+  - package-ecosystem: pip
+    directories:
+      - /src
+      - /
+    schedule:
+      interval: weekly
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
+
+  # Base images of src/Dockerfile (Lambda) and src/Dockerfile_ecs (Fargate).
+  - package-ecosystem: docker
+    directory: /src
+    schedule:
+      interval: weekly
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
