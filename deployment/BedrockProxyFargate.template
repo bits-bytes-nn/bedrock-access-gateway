@@ -36,6 +36,10 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional comma-separated list of hosts remote image URLs may point at. Empty allows any publicly routable host.
+  AllowedOrigins:
+    Type: String
+    Default: "*"
+    Description: Comma-separated browser origins allowed by CORS (e.g. https://app.example.com), "*" (default) for any, or empty for none. Restricting it is recommended unless browsers call the API directly; server-side clients are not affected by CORS.
   EnablePromptCaching:
     Type: String
     Default: "false"
@@ -302,6 +306,9 @@ Resources:
             - Name: IMAGE_URL_ALLOWED_HOSTS
               Value:
                 Ref: ImageUrlAllowedHosts
+            - Name: ALLOWED_ORIGINS
+              Value:
+                Ref: AllowedOrigins
           Essential: true
           LogConfiguration:
             LogDriver: awslogs

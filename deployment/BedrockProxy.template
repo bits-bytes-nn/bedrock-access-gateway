@@ -86,13 +86,13 @@ Parameters:
     Description: Value of the CostTagKey tag.
   ReservedConcurrency:
     Type: String
-    Default: "20"
+    Default: ""
     AllowedPattern: ^[0-9]*$
-    Description: Concurrent executions reserved for (and capped at) the function, so a leaked key or runaway client cannot use the account's whole Lambda concurrency or spend without bound. Calls above it fail until one finishes. 0 or empty leaves the function unreserved.
+    Description: Concurrent executions reserved for (and capped at) the function, so a leaked key or runaway client cannot use the account's whole Lambda concurrency or spend without bound. Calls above it fail until one finishes. Empty (default) or 0 leaves the function unreserved. A value such as 20 is recommended; the account must keep at least 100 unreserved concurrent executions, so it fails on accounts with a low concurrency quota.
   AllowedOrigins:
     Type: String
-    Default: ""
-    Description: Comma-separated browser origins allowed by CORS (e.g. https://app.example.com), or "*" for any. Empty allows no browser origin; server-side clients are not affected by CORS.
+    Default: "*"
+    Description: Comma-separated browser origins allowed by CORS (e.g. https://app.example.com), "*" (default) for any, or empty for none. Restricting it is recommended unless browsers call the API directly; server-side clients are not affected by CORS.
   ApiSecurityPolicy:
     Type: String
     Default: SecurityPolicy_TLS13_1_2_2021_06
@@ -111,11 +111,11 @@ Parameters:
     Description: Endpoint access mode for the enhanced (SecurityPolicy_*) policies, ignored for TLS_1_0. STRICT rejects requests whose SNI does not match the Host header; switch to it after the access logs show no such clients. STRICT back to BASIC makes the endpoint unavailable for about 15 minutes.
   EnableAccessLogs:
     Type: String
-    Default: "true"
+    Default: "false"
     AllowedValues:
       - "true"
       - "false"
-    Description: Write API Gateway access logs (request id, source IP, method, path, status, response size, integration latency, TLS version; no headers or bodies) to /aws/apigateway/<stack name>-access. Requires the account-level API Gateway CloudWatch Logs role (AWS::ApiGateway::Account, e.g. from deployment/AccountGuardrails.template) in this Region; set "false" until it exists, or the stage update fails.
+    Description: Write API Gateway access logs (request id, source IP, method, path, status, response size, integration latency, protocol, TLS version, API Gateway error message; no headers or bodies) to /aws/apigateway/<stack name>-access. Recommended. Requires the account-level API Gateway CloudWatch Logs role (AWS::ApiGateway::Account, e.g. from deployment/AccountGuardrails.template) in this Region, or the stage update fails; hence the default "false".
   AccessLogRetentionInDays:
     Type: Number
     Default: 30
@@ -311,7 +311,7 @@ Resources:
       AccessLogSetting: !If
         - HasAccessLogs
         - DestinationArn: !GetAtt ApiAccessLogGroup.Arn
-          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","tlsVersion":"$context.tlsVersion"}'
+          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","protocol":"$context.protocol","tlsVersion":"$context.tlsVersion","errorMessage":"$context.error.message"}'
         - !Ref AWS::NoValue
 
   # Alarms, sent by email (and their recovery) when AlarmEmail is set.
