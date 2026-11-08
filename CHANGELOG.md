@@ -4,7 +4,23 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
 
 ## Unreleased
 
+### Security
+- `certifi` 2026.10.23 (GHSA-6q48-6c7w-9gw2, critical in Amazon Inspector for the Lambda image).
+- Lambda template: the API accepts TLS 1.2 and later (`ApiSecurityPolicy`, default
+  `SecurityPolicy_TLS13_1_2_2021_06`, with `ApiEndpointAccessMode` `BASIC`) instead of the Regional default
+  `TLS_1_0`; the function's concurrency is reserved and capped (`ReservedConcurrency`, default 20); CORS allows
+  no browser origin unless `AllowedOrigins` lists some (the function previously allowed `*`).
+- `scripts/deploy-lambda.sh` builds only a commit with a successful CI run on GitHub (`ALLOW_UNVERIFIED=1` skips
+  the check; `IMAGE_URI` rollbacks never run it), and sets the ECR repository to immutable tags with a lifecycle
+  policy keeping the newest 10 images. Image tags now include the build time.
+
 ### Added
+- Lambda template: JSON stage access logs in `/aws/apigateway/<stack name>-access` (`EnableAccessLogs`, default
+  `true`; `AccessLogRetentionInDays`, default 30), which need the account-level API Gateway CloudWatch Logs role;
+  a Throttles alarm when `AlarmEmail` is set.
+- CI: a 93% coverage floor, `pip-audit`, report-only cfn-guard against the Guard Rules Registry Well-Architected
+  rules, the Fargate image build and a `/health` smoke test of both images; actions pinned by commit. Weekly
+  Dependabot updates for pip, Docker and GitHub Actions.
 - Lambda template: optional email alarms (`AlarmEmail`) for no calls in `IdleHours`, more than
   `SpikeInvocationsPerHour` calls in an hour and more than `ServerErrorsPerHour` 5XX responses, with recovery
   notices; optional cost tag on the Lambda role (`CostTagKey`/`CostTagValue`) so Bedrock's IAM principal cost

@@ -139,6 +139,17 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
    - **LogRetentionInDays**: (Optional) How long the logs are kept (default 90)
    - **ThrottlingRateLimit**, **ThrottlingBurstLimit** (Lambda template only): (Optional) Requests per second and
      burst the API accepts (default 10 and 20), which caps the Bedrock spend if the API key leaks
+   - **ReservedConcurrency** (Lambda template only): (Optional) Concurrent executions reserved for and capped at
+     the function (default 20; `0` or empty for none). With `AlarmEmail` set, throttled calls raise an alarm
+   - **ApiSecurityPolicy**, **ApiEndpointAccessMode** (Lambda template only): (Optional) TLS policy of the API
+     endpoint (default `SecurityPolicy_TLS13_1_2_2021_06`, TLS 1.2 and 1.3, in `BASIC` mode). Switch to `STRICT`
+     once the access logs show every client on the execute-api host name
+   - **EnableAccessLogs**, **AccessLogRetentionInDays** (Lambda template only): (Optional) JSON access logs of the
+     API stage (default on, kept 30 days). They need the account's API Gateway CloudWatch Logs role
+     (`AWS::ApiGateway::Account`, set once per Region and not part of this stack); set `EnableAccessLogs` to
+     `false` until it exists, or the stack update fails
+   - **AllowedOrigins** (Lambda template only): (Optional) Browser origins allowed by CORS; empty (default) allows
+     none. Server-side clients do not use CORS
    - **CertificateArn** (Fargate template only): ACM certificate for an HTTPS listener, with HTTP redirected to
      HTTPS. Without it the ALB serves plain HTTP and the API key travels unencrypted; see the
      [Security Guide](./docs/Security.md#1-https-on-the-alb)
@@ -420,10 +431,15 @@ AWS_REGION=<region> STACK_NAME=<stack name> scripts/deploy-lambda.sh --preview
 AWS_REGION=<region> STACK_NAME=<stack name> scripts/deploy-lambda.sh
 ```
 
-The script tags the image with the git commit, pins `ContainerImageUri` to the pushed digest, applies the
-current template and keeps every other parameter's value. Pass overrides with `PARAMETERS="Key=Value ..."`.
-To roll back, redeploy the earlier image by digest, which skips the build (images are tagged with their commit
-in ECR):
+The script builds only a commit whose CI run succeeded on GitHub (checked with the `gh` CLI in the `fork` remote's
+repository, or `origin`'s, or `CI_REPO`); push the commit and wait for CI first, or set `ALLOW_UNVERIFIED=1` to
+skip the check. It tags the image with the git commit and build time, pins `ContainerImageUri` to the pushed
+digest, applies the current template and keeps every other parameter's value. Pass overrides with
+`PARAMETERS="Key=Value ..."`. Before each push it sets the ECR repository to immutable tags and a lifecycle
+policy that keeps the newest 10 images, which bounds how far back a rollback can go. With immutable tags,
+`scripts/push-to-ecr.sh` cannot push the same tag (such as `latest`) twice to that repository.
+To roll back, redeploy the earlier image by digest, which skips the build and the CI check (images are tagged
+with their commit in ECR):
 
 ```bash
 AWS_REGION=<region> IMAGE_URI=<account>.dkr.ecr.<region>.amazonaws.com/bedrock-proxy-api@sha256:<digest> \
@@ -461,7 +477,7 @@ The application reads these environment variables. The Lambda template sets them
 | `ENABLE_IMAGE_URL_FETCH` | `true` | Allow remote http(s) image URLs |
 | `IMAGE_URL_ALLOWED_HOSTS` | | Comma-separated hosts remote image URLs may point at |
 | `IMAGE_URL_MAX_SIZE_MB` | `10` | Maximum size of a fetched image |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins; empty allows none. The Lambda template sets it from `AllowedOrigins` (default empty). |
 | `DEBUG` | `false` | Log requests and responses, including prompts. Do not enable with sensitive data. |
 
 Boolean settings accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); any other value stops the application at startup.
@@ -477,7 +493,10 @@ shellcheck scripts/*.sh
 ```
 
 The tests replace the AWS clients with mocks and never call AWS. CI runs the same commands on pushes to `main`
-and on pull requests, and also builds the Lambda image.
+and on pull requests, with a coverage floor of 93% and `pip-audit` on the pinned dependencies. It also builds
+both images and checks that they answer `/health`, and reports (without failing) cfn-guard findings against the
+Well-Architected rules of the AWS Guard Rules Registry. Dependabot proposes pip, Docker and GitHub Actions
+updates weekly.
 
 Runtime dependencies are declared in [`src/requirements.in`](src/requirements.in) and locked, transitive
 dependencies included, in `src/requirements.txt`. After changing `requirements.in`, regenerate the lock with the
