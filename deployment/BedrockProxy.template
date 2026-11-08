@@ -84,9 +84,49 @@ Parameters:
     Type: String
     Default: ""
     Description: Value of the CostTagKey tag.
+  ReservedConcurrency:
+    Type: String
+    Default: "20"
+    AllowedPattern: ^[0-9]*$
+    Description: Concurrent executions reserved for (and capped at) the function, so a leaked key or runaway client cannot use the account's whole Lambda concurrency or spend without bound. Calls above it fail until one finishes. 0 or empty leaves the function unreserved.
+  AllowedOrigins:
+    Type: String
+    Default: ""
+    Description: Comma-separated browser origins allowed by CORS (e.g. https://app.example.com), or "*" for any. Empty allows no browser origin; server-side clients are not affected by CORS.
+  ApiSecurityPolicy:
+    Type: String
+    Default: SecurityPolicy_TLS13_1_2_2021_06
+    AllowedValues:
+      - SecurityPolicy_TLS13_1_2_2021_06
+      - SecurityPolicy_TLS13_1_2_PFS_PQ_2025_09
+      - SecurityPolicy_TLS13_1_3_2025_09
+      - TLS_1_0
+    Description: TLS security policy of the execute-api endpoint. The default accepts TLS 1.2 and 1.3 with the TLS_1_2 cipher suites; TLS_1_0 is API Gateway's legacy default for Regional APIs. A change takes about 15 minutes, during which the API stays available.
+  ApiEndpointAccessMode:
+    Type: String
+    Default: BASIC
+    AllowedValues:
+      - BASIC
+      - STRICT
+    Description: Endpoint access mode for the enhanced (SecurityPolicy_*) policies, ignored for TLS_1_0. STRICT rejects requests whose SNI does not match the Host header; switch to it after the access logs show no such clients. STRICT back to BASIC makes the endpoint unavailable for about 15 minutes.
+  EnableAccessLogs:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Write API Gateway access logs (request id, source IP, method, path, status, response size, integration latency, TLS version; no headers or bodies) to /aws/apigateway/<stack name>-access. Requires the account-level API Gateway CloudWatch Logs role (AWS::ApiGateway::Account, e.g. from deployment/AccountGuardrails.template) in this Region; set "false" until it exists, or the stage update fails.
+  AccessLogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365, 731]
+    Description: How long CloudWatch keeps the API Gateway access logs
 Conditions:
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
   HasCostTag: !Not [!Equals [!Ref CostTagKey, ""]]
+  HasReservedConcurrency: !Not [!Or [!Equals [!Ref ReservedConcurrency, ""], !Equals [!Ref ReservedConcurrency, "0"]]]
+  IsEnhancedSecurityPolicy: !Not [!Equals [!Ref ApiSecurityPolicy, TLS_1_0]]
+  HasAccessLogs: !Equals [!Ref EnableAccessLogs, "true"]
 Resources:
   # IAM Role for Lambda
   ProxyApiHandlerServiceRole:
@@ -168,11 +208,15 @@ Resources:
           ENABLE_IMAGE_URL_FETCH: !Ref EnableImageUrlFetch
           IMAGE_URL_ALLOWED_HOSTS: !Ref ImageUrlAllowedHosts
           API_ROUTE_PREFIX: /v1
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+      # Text: the image runs uvicorn directly (no Lambda Python runtime client), so the JSON
+      # format would wrap only Lambda's platform lines and leave the application's lines as text.
       LoggingConfig:
         LogFormat: Text
         LogGroup: !Ref ProxyApiHandlerLogGroup
       MemorySize: 1024
       PackageType: Image
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
       Role: !GetAtt ProxyApiHandlerServiceRole.Arn
       Timeout: 600
     DependsOn:
@@ -187,6 +231,9 @@ Resources:
       EndpointConfiguration:
         Types:
           - REGIONAL
+      SecurityPolicy: !Ref ApiSecurityPolicy
+      # Required with the enhanced policies; must be unset with the legacy TLS_1_0.
+      EndpointAccessMode: !If [IsEnhancedSecurityPolicy, !Ref ApiEndpointAccessMode, !Ref AWS::NoValue]
       Body:
         openapi: "3.0.1"
         info:
@@ -240,6 +287,13 @@ Resources:
     Properties:
       RestApiId: !Ref RestApi
 
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasAccessLogs
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access"
+      RetentionInDays: !Ref AccessLogRetentionInDays
+
   # API Gateway Stage
   ApiStage:
     Type: AWS::ApiGateway::Stage
@@ -253,6 +307,12 @@ Resources:
           HttpMethod: "*"
           ThrottlingRateLimit: !Ref ThrottlingRateLimit
           ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+      # API Gateway writes these through the account's CloudWatch Logs role (see EnableAccessLogs).
+      AccessLogSetting: !If
+        - HasAccessLogs
+        - DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","tlsVersion":"$context.tlsVersion"}'
+        - !Ref AWS::NoValue
 
   # Alarms, sent by email (and their recovery) when AlarmEmail is set.
   AlarmTopic:
@@ -319,6 +379,25 @@ Resources:
       Period: 3600
       EvaluationPeriods: 1
       Threshold: !Ref ServerErrorsPerHour
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: "Lambda throttled gateway calls in the last hour: the reserved concurrency (ReservedConcurrency) or the account limit was reached."
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProxyApiHandler
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlarmTopic]
