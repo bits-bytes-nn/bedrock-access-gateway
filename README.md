@@ -106,14 +106,15 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
 
 3. Follow the prompts to configure:
    - ECR repository names (or use defaults)
-   - Image tag (or use default: `latest`)
+   - Image tag (or use the default, `<commit>-<UTC time>`, which is new on every run)
    - AWS region (or use default: `us-east-1`)
 
 4. The script will build and push both Lambda and ECS/Fargate images to your ECR repositories.
 
 5. **Important**: Copy the image URIs displayed at the end of the script output. You'll need these in the next step.
-   Prefer a unique tag (for example the git commit) over `latest`: CloudFormation only redeploys the
-   function when the image URI changes.
+   Keep the unique default tag rather than `latest`: CloudFormation only redeploys the function when the
+   image URI changes, and a repository with immutable tags (which `scripts/deploy-lambda.sh` sets) rejects a
+   tag that was pushed before.
 
 **Step 3: Deploy the CloudFormation stack**
 
@@ -140,16 +141,20 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
    - **ThrottlingRateLimit**, **ThrottlingBurstLimit** (Lambda template only): (Optional) Requests per second and
      burst the API accepts (default 10 and 20), which caps the Bedrock spend if the API key leaks
    - **ReservedConcurrency** (Lambda template only): (Optional) Concurrent executions reserved for and capped at
-     the function (default 20; `0` or empty for none). With `AlarmEmail` set, throttled calls raise an alarm
+     the function (default empty, unreserved). `20` is recommended to bound the spend of a leaked key; Lambda
+     keeps at least 100 unreserved concurrent executions per account, so accounts with a low concurrency quota
+     cannot reserve any. With `AlarmEmail` set, throttled calls raise an alarm
    - **ApiSecurityPolicy**, **ApiEndpointAccessMode** (Lambda template only): (Optional) TLS policy of the API
      endpoint (default `SecurityPolicy_TLS13_1_2_2021_06`, TLS 1.2 and 1.3, in `BASIC` mode). Switch to `STRICT`
      once the access logs show every client on the execute-api host name
    - **EnableAccessLogs**, **AccessLogRetentionInDays** (Lambda template only): (Optional) JSON access logs of the
-     API stage (default on, kept 30 days). They need the account's API Gateway CloudWatch Logs role
-     (`AWS::ApiGateway::Account`, set once per Region and not part of this stack); set `EnableAccessLogs` to
-     `false` until it exists, or the stack update fails
-   - **AllowedOrigins** (Lambda template only): (Optional) Browser origins allowed by CORS; empty (default) allows
-     none. Server-side clients do not use CORS
+     API stage (default off, kept 30 days). `true` is recommended once the account's API Gateway CloudWatch Logs
+     role exists (`AWS::ApiGateway::Account`, set once per Region and not part of this stack, for example by
+     [`deployment/AccountGuardrails.template`](deployment/AccountGuardrails.template)); without it the stack
+     update fails
+   - **AllowedOrigins**: (Optional) Comma-separated browser origins allowed by CORS (default `*`, any; empty
+     allows none). Restrict it to your web app's origins, or leave it empty if no browser calls the API;
+     server-side clients do not use CORS
    - **CertificateArn** (Fargate template only): ACM certificate for an HTTPS listener, with HTTP redirected to
      HTTPS. Without it the ALB serves plain HTTP and the API key travels unencrypted; see the
      [Security Guide](./docs/Security.md#1-https-on-the-alb)
@@ -433,13 +438,22 @@ AWS_REGION=<region> STACK_NAME=<stack name> scripts/deploy-lambda.sh
 
 The script builds only a commit whose CI run succeeded on GitHub (checked with the `gh` CLI in the `fork` remote's
 repository, or `origin`'s, or `CI_REPO`); push the commit and wait for CI first, or set `ALLOW_UNVERIFIED=1` to
-skip the check. It tags the image with the git commit and build time, pins `ContainerImageUri` to the pushed
-digest, applies the current template and keeps every other parameter's value. Pass overrides with
-`PARAMETERS="Key=Value ..."`. Before each push it sets the ECR repository to immutable tags and a lifecycle
-policy that keeps the newest 10 images, which bounds how far back a rollback can go. With immutable tags,
-`scripts/push-to-ecr.sh` cannot push the same tag (such as `latest`) twice to that repository.
-To roll back, redeploy the earlier image by digest, which skips the build and the CI check (images are tagged
-with their commit in ECR):
+skip the check. Uncommitted changes to `src/` or the template are not covered by CI either, so they need
+`ALLOW_DIRTY=1` and `ALLOW_UNVERIFIED=1`. It tags the image with the git commit and build time, pins
+`ContainerImageUri` to the pushed digest, applies the current template and keeps every other parameter's value
+(`aws cloudformation deploy` uses the stack's current value for each parameter not passed). Pass overrides with
+`PARAMETERS="Key=Value ..."`.
+
+The script sets the ECR repository to immutable tags and a lifecycle policy that keeps the newest
+`ECR_KEEP_DEPLOYED` (default 10) deployed images and the newest `ECR_KEEP_IMAGES` (default 10) images overall.
+After the stack update completes it adds a `deployed-<UTC time>` tag to the image the function runs (also for
+rollbacks), and before each run it tags the image the stack runs if it has no such tag, so builds and
+`--preview` runs cannot expire the running image or the earlier deployed ones. It replaces a lifecycle policy it
+did not set with a notice that prints the old one. The policy ranks deployed images by push time, so the script
+warns when a rolled-back image is older than the newest `ECR_KEEP_DEPLOYED` deployed images.
+To roll back, redeploy an earlier image by digest, which skips the build and the CI check (images are tagged
+with their commit, and deployed ones with `deployed-*`, in ECR). Uncommitted template changes still need
+`ALLOW_UNVERIFIED=1`:
 
 ```bash
 AWS_REGION=<region> IMAGE_URI=<account>.dkr.ecr.<region>.amazonaws.com/bedrock-proxy-api@sha256:<digest> \
@@ -453,7 +467,7 @@ If you set the matching environment variables on the function by hand (for examp
 check them with `aws lambda get-function-configuration` first and pass them through `PARAMETERS`, because a
 stack update replaces the function's whole environment.
 
-For the Fargate stack, push a new image with a unique tag using `scripts/push-to-ecr.sh`, then update the stack
+For the Fargate stack, push a new image with `scripts/push-to-ecr.sh` (its default tag is unique), then update the stack
 with the new `ContainerImageUri`. A deployment whose tasks fail to start is rolled back automatically. The
 Fargate stack has no request throttling; restrict who can reach the ALB if the key could leak.
 
@@ -477,7 +491,7 @@ The application reads these environment variables. The Lambda template sets them
 | `ENABLE_IMAGE_URL_FETCH` | `true` | Allow remote http(s) image URLs |
 | `IMAGE_URL_ALLOWED_HOSTS` | | Comma-separated hosts remote image URLs may point at |
 | `IMAGE_URL_MAX_SIZE_MB` | `10` | Maximum size of a fetched image |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins; empty allows none. The Lambda template sets it from `AllowedOrigins` (default empty). |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins; empty allows none. Both templates set it from `AllowedOrigins` (default `*`). |
 | `DEBUG` | `false` | Log requests and responses, including prompts. Do not enable with sensitive data. |
 
 Boolean settings accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); any other value stops the application at startup.
