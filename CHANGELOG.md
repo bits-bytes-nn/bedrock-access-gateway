@@ -24,6 +24,13 @@ Changes in this fork since it diverged from upstream at `144c4bc` (upstream depr
   repository with immutable tags rejects on the second push.
 
 ### Added
+- Per-call token metrics (`ENABLE_TOKEN_METRICS`, stack parameter `EnableTokenMetrics`, default `false`): one
+  CloudWatch embedded metric format line on stdout after each chat completion (streaming or not) and embeddings
+  call, with `InputTokens`, `OutputTokens`, `CacheReadTokens` and `CacheWriteTokens` by `Model` and in total, in
+  `TOKEN_METRICS_NAMESPACE` (`TokenMetricsNamespace`, default `BedrockAccessGateway`). The line carries the model
+  id and counts only. Lambda template: `TokenAlarmPerHour` (default empty, none) alarms on the hourly sum of input,
+  output and cache-write tokens when `AlarmEmail` is set; a stack rule rejects it without `EnableTokenMetrics` or
+  `AlarmEmail`.
 - Lambda template: JSON stage access logs in `/aws/apigateway/<stack name>-access`, with the request protocol and
   API Gateway error message (`EnableAccessLogs`, default `false`, recommended `true` once the account-level API
   Gateway CloudWatch Logs role exists; `AccessLogRetentionInDays`, default 30); a Throttles alarm when

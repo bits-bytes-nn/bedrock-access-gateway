@@ -2,12 +2,13 @@
 
 import io
 import json
+import time
 
 import pytest
 from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
-from api import setting
+from api import metrics, setting
 from api.app import app
 from api.models import bedrock as bedrock_module
 from api.setting import DEFAULT_MODEL
@@ -949,3 +950,146 @@ def test_json_stream_keeps_reasoning_out_of_the_content(client, runtime):
     chunks = [json.loads(line[6:]) for line in lines if line.startswith("data: {")]
     content = "".join(chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks if chunk["choices"])
     assert json.loads(content) == {"city": "Seoul"}
+
+
+# --- token metrics (CloudWatch embedded metric format) ------------------------------
+
+METRIC_NAMES = ["InputTokens", "OutputTokens", "CacheReadTokens", "CacheWriteTokens"]
+SECRET_PROMPT = "my secret prompt 4242"
+
+
+@pytest.fixture
+def token_metrics(monkeypatch):
+    monkeypatch.setattr(metrics, "ENABLE_TOKEN_METRICS", True)
+
+
+def emf_lines(capsys) -> list[dict]:
+    out = capsys.readouterr().out
+    # Each line must be a JSON object on its own, with nothing before or after it.
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def assert_emf_shape(line: dict, model: str, values: list[int]):
+    directive = line["_aws"]["CloudWatchMetrics"]
+    assert directive == [
+        {
+            "Namespace": "BedrockAccessGateway",
+            "Dimensions": [["Model"], []],
+            "Metrics": [{"Name": name, "Unit": "Count"} for name in METRIC_NAMES],
+        }
+    ]
+    assert isinstance(line["_aws"]["Timestamp"], int)
+    assert abs(line["_aws"]["Timestamp"] / 1000 - time.time()) < 60
+    # Only the metadata, the model dimension and the four counts: nothing about the caller.
+    assert set(line) == {"_aws", "Model", *METRIC_NAMES}
+    assert line["Model"] == model
+    assert [line[name] for name in METRIC_NAMES] == values
+
+
+CACHED_USAGE = {
+    "inputTokens": 3,
+    "outputTokens": 2,
+    "totalTokens": 45,
+    "cacheReadInputTokens": 20,
+    "cacheWriteInputTokens": 20,
+}
+
+
+def test_chat_writes_one_emf_line(client, runtime, token_metrics, capsys):
+    result = converse_result([{"text": "answer"}])
+    result["usage"] = CACHED_USAGE
+    runtime.converse.return_value = result
+    capsys.readouterr()
+    assert chat(client, messages=[{"role": "user", "content": SECRET_PROMPT}]).status_code == 200
+    out = capsys.readouterr().out
+    assert SECRET_PROMPT not in out and "answer" not in out and "test-api-key" not in out
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert len(lines) == 1
+    assert_emf_shape(lines[0], CHAT_MODEL, [3, 2, 20, 20])
+
+
+@pytest.mark.parametrize("stream_options", [None, {"include_usage": True}])
+def test_stream_writes_one_emf_line(client, runtime, token_metrics, capsys, stream_options):
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "answer"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 34, "cacheWriteInputTokens": 30}}},
+    ]
+    runtime.converse_stream.return_value = {"stream": iter(events)}
+    capsys.readouterr()
+    body = {"stream": True, "messages": [{"role": "user", "content": SECRET_PROMPT}]}
+    if stream_options:
+        body["stream_options"] = stream_options
+    assert chat(client, **body).status_code == 200
+    out = capsys.readouterr().out
+    assert SECRET_PROMPT not in out and "answer" not in out
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert len(lines) == 1
+    assert_emf_shape(lines[0], CHAT_MODEL, [3, 1, 0, 30])
+
+
+def test_stream_without_usage_writes_no_line(client, runtime, token_metrics, capsys):
+    runtime.converse_stream.return_value = {"stream": iter([{"messageStop": {"stopReason": "end_turn"}}])}
+    capsys.readouterr()
+    assert chat(client, stream=True).status_code == 200
+    assert emf_lines(capsys) == []
+
+
+def test_openai_model_name_is_recorded_as_the_default_model(client, runtime, token_metrics, monkeypatch, capsys):
+    monkeypatch.setattr(bedrock_module, "bedrock_model_list", {DEFAULT_MODEL: {"modalities": ["TEXT"]}})
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    capsys.readouterr()
+    assert chat(client, model="gpt-4o").status_code == 200
+    assert emf_lines(capsys)[0]["Model"] == DEFAULT_MODEL
+
+
+def test_embeddings_write_one_emf_line(client, runtime, token_metrics, capsys):
+    runtime.invoke_model.side_effect = titan_response
+    capsys.readouterr()
+    assert embed(client, model=TITAN_V2, input=[SECRET_PROMPT, "b"]).status_code == 200
+    out = capsys.readouterr().out
+    assert SECRET_PROMPT not in out
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert len(lines) == 1
+    assert_emf_shape(lines[0], TITAN_V2, [4, 0, 0, 0])
+
+
+def test_token_metrics_are_off_by_default(client, runtime, capsys):
+    assert setting.ENABLE_TOKEN_METRICS is False and metrics.ENABLE_TOKEN_METRICS is False
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    runtime.invoke_model.side_effect = titan_response
+    capsys.readouterr()
+    assert chat(client).status_code == 200
+    assert embed(client, model=TITAN_V2, input="a").status_code == 200
+    assert capsys.readouterr().out == ""
+
+
+def test_failed_metrics_write_does_not_fail_the_request(client, runtime, token_metrics, monkeypatch):
+    class BrokenStdout:
+        def write(self, _text):
+            raise OSError("closed")
+
+    monkeypatch.setattr(metrics.sys, "stdout", BrokenStdout())
+    runtime.converse.return_value = converse_result([{"text": "ok"}])
+    assert chat(client).status_code == 200
+
+
+@pytest.mark.parametrize("model,expected", [("a" * 1025, "other"), ("bad\nid", "other"), ("", "other")])
+def test_invalid_dimension_values_are_replaced(model, expected):
+    line = json.loads(metrics.token_metrics_line(model, {"inputTokens": 1}))
+    assert line["Model"] == expected
+    assert [line[name] for name in METRIC_NAMES] == [1, 0, 0, 0]
+
+
+@pytest.mark.parametrize("value,expected", [("", "Default"), ("  My/App ", "My/App")])
+def test_namespace_setting(monkeypatch, value, expected):
+    monkeypatch.setenv("SOME_NAMESPACE", value)
+    assert setting._env_namespace("SOME_NAMESPACE", "Default") == expected
+
+
+@pytest.mark.parametrize("value", ["AWS/Bedrock", "x" * 256, "caf\u00e9"])
+def test_invalid_namespace_fails_fast(monkeypatch, value):
+    monkeypatch.setenv("SOME_NAMESPACE", value)
+    with pytest.raises(RuntimeError):
+        setting._env_namespace("SOME_NAMESPACE", "Default")

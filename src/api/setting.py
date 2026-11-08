@@ -27,6 +27,18 @@ def _env_positive_int(name: str, default: int) -> int:
     return number
 
 
+def _env_namespace(name: str, default: str) -> str:
+    """Read a CloudWatch metric namespace, refusing one that CloudWatch would drop.
+
+    EMF publishes nothing for a namespace that is not 1 to 255 printable ASCII characters,
+    and "AWS/" is reserved for AWS services, so a typo fails at startup instead.
+    """
+    value = (os.environ.get(name) or "").strip() or default
+    if len(value) > 255 or not all(" " <= char <= "~" for char in value) or value.startswith("AWS/"):
+        raise RuntimeError(f"{name} must be a CloudWatch namespace (printable ASCII, not AWS/), got {value!r}")
+    return value
+
+
 API_ROUTE_PREFIX = os.environ.get("API_ROUTE_PREFIX", "/api/v1")
 
 TITLE = "Amazon Bedrock Proxy APIs"
@@ -61,3 +73,9 @@ IMAGE_URL_ALLOWED_HOSTS = frozenset(
     host.strip().lower() for host in os.environ.get("IMAGE_URL_ALLOWED_HOSTS", "").split(",") if host.strip()
 )
 IMAGE_URL_MAX_SIZE_MB = _env_positive_int("IMAGE_URL_MAX_SIZE_MB", 10)
+
+# One CloudWatch embedded metric format (EMF) line per completion and embeddings call, on
+# stdout, with its token counts by model and in total (see api/metrics.py). Lambda sends
+# stdout to CloudWatch Logs, which turns the lines into metrics without an API call.
+ENABLE_TOKEN_METRICS = _env_flag("ENABLE_TOKEN_METRICS", False)
+TOKEN_METRICS_NAMESPACE = _env_namespace("TOKEN_METRICS_NAMESPACE", "BedrockAccessGateway")

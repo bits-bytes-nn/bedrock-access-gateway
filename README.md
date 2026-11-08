@@ -144,6 +144,9 @@ After creation, you'll see your secret in the Secrets Manager console. Make note
      the function (default empty, unreserved). `20` is recommended to bound the spend of a leaked key; Lambda
      keeps at least 100 unreserved concurrent executions per account, so accounts with a low concurrency quota
      cannot reserve any. With `AlarmEmail` set, throttled calls raise an alarm
+   - **EnableTokenMetrics**, **TokenMetricsNamespace**, **TokenAlarmPerHour** (Lambda template only): (Optional)
+     per-call token metrics (default off) and an hourly token alarm (default none), see
+     [Token metrics and alarm](#token-metrics-and-alarm). `true` and `10000000` are recommended with `AlarmEmail`
    - **ApiSecurityPolicy**, **ApiEndpointAccessMode** (Lambda template only): (Optional) TLS policy of the API
      endpoint (default `SecurityPolicy_TLS13_1_2_2021_06`, TLS 1.2 and 1.3, in `BASIC` mode). Switch to `STRICT`
      once the access logs show every client on the execute-api host name
@@ -347,6 +350,55 @@ curl $OPENAI_BASE_URL/chat/completions \
 
 For more information, see the [Amazon Bedrock Prompt Caching Guide](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
 
+### Token metrics and alarm
+
+Bedrock's own `AWS/Bedrock` token metrics are per model for the whole account and Region, so they also count
+other workloads, and the gateway's invocation alarms do not see how large each call is. With
+`ENABLE_TOKEN_METRICS=true` (stack parameter `EnableTokenMetrics`) the gateway writes one line in
+[CloudWatch embedded metric format](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html)
+(EMF) to stdout after each chat completion (streaming or not) and embeddings call. Lambda sends stdout to the
+function's log group and CloudWatch Logs extracts the metrics from it, with no agent, API call or IAM permission
+([EMF with Lambda](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Lambda.html)).
+The image runs uvicorn without the Lambda runtime client and the template keeps the `Text` log format, so each
+line reaches the log as written, which EMF requires (a JSON object with nothing before or after it).
+
+Metrics, all `Count`, in the namespace `TOKEN_METRICS_NAMESPACE` (default `BedrockAccessGateway`):
+
+| Metric | Bedrock usage field |
+|---|---|
+| `InputTokens` | `inputTokens` (uncached input) |
+| `OutputTokens` | `outputTokens` |
+| `CacheReadTokens` | `cacheReadInputTokens` |
+| `CacheWriteTokens` | `cacheWriteInputTokens` |
+
+Each is published with the dimension `Model` and without dimensions; the dimensionless metric is the total for
+all models. `Model` is the model id the request named after the gateway's substitutions (`gpt-*` becomes
+`DEFAULT_MODEL`): it is checked against the model list before Bedrock is called, so arbitrary client input never
+becomes a dimension, and it keeps inference profiles apart (`global.` and regional profiles are priced
+differently). Embeddings report `InputTokens` only; Nova embeddings counts are estimated with `cl100k_base`. The
+line holds the model id and the counts only, no prompt, response, API key or client detail. A stream the client
+abandons before Bedrock's final usage event records nothing for that call.
+
+Custom metrics are billed per metric and month: 4 per model used plus 4 totals. A line that fails EMF validation
+shows in the `AWS/Logs` `EMFParsingErrors` and `EMFValidationErrors` metrics of the log group.
+
+`TokenAlarmPerHour` (with `AlarmEmail` and `EnableTokenMetrics=true`, which the stack checks) adds an alarm on
+`InputTokens + OutputTokens + CacheWriteTokens` summed over an hour; cache reads, at a tenth of the input price,
+are left out. It emails the alarm topic when the threshold is crossed and when the hour after is back under it.
+`10000000` is a starting point for one heavy client: a typical heavy hour is about 1 to 2 million tokens
+including cache writes, and over 14 days the account-wide `AWS/Bedrock` total (an upper bound, other workloads
+included) had a 99th-percentile hour of 2.8 million and a highest hour of 12.8 million, during a client bug that
+rewrote the prompt cache on every call. Adjust it once a few weeks of the gateway's own metrics exist:
+
+```bash
+# Hourly sums of the three alarmed metrics; add them up per hour and take a margin above the busiest one.
+for metric in InputTokens OutputTokens CacheWriteTokens; do
+  aws cloudwatch get-metric-statistics --namespace BedrockAccessGateway --metric-name "$metric" \
+    --statistics Sum --period 3600 --start-time <ISO time> --end-time <ISO time> \
+    --query 'sort_by(Datapoints, &Sum)[-3:]'
+done
+```
+
 ## Other Examples
 
 ### LangChain
@@ -492,6 +544,8 @@ The application reads these environment variables. The Lambda template sets them
 | `IMAGE_URL_ALLOWED_HOSTS` | | Comma-separated hosts remote image URLs may point at |
 | `IMAGE_URL_MAX_SIZE_MB` | `10` | Maximum size of a fetched image |
 | `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins; empty allows none. Both templates set it from `AllowedOrigins` (default `*`). |
+| `ENABLE_TOKEN_METRICS` | `false` | Write per-call token counts as CloudWatch EMF lines to stdout, see [Token metrics and alarm](#token-metrics-and-alarm) |
+| `TOKEN_METRICS_NAMESPACE` | `BedrockAccessGateway` | CloudWatch namespace of the token metrics |
 | `DEBUG` | `false` | Log requests and responses, including prompts. Do not enable with sensitive data. |
 
 Boolean settings accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); any other value stops the application at startup.

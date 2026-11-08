@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 
 from api.image_url import parse_image_url
+from api.metrics import record_tokens
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
 from api.models.model_rules import ModelRules, Sampling, Thinking, rules_for
 from api.schema import (
@@ -299,6 +300,7 @@ class BedrockModel(BaseChatModel):
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
         """Run a non-streaming chat completion."""
         response = await self._invoke_bedrock(chat_request)
+        record_tokens(chat_request.model, response.get("usage"))
         chat_response = self._create_response(
             model=chat_request.model,
             message_id=self.generate_message_id(),
@@ -349,6 +351,9 @@ class BedrockModel(BaseChatModel):
         try:
             # Reading the next event blocks on the socket, so do it in the thread pool.
             async for chunk in iterate_in_threadpool(stream):
+                if "metadata" in chunk:
+                    # Recorded whether or not the client asked for the usage chunk.
+                    record_tokens(chat_request.model, chunk["metadata"].get("usage"))
                 stream_response = self._create_response_stream(
                     model_id=chat_request.model, message_id=message_id, chunk=chunk
                 )
@@ -1034,6 +1039,7 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
         input_tokens: int,
         encoding_format: Literal["float", "base64"],
     ) -> EmbeddingsResponse:
+        record_tokens(model, {"inputTokens": input_tokens})
         data = []
         for i, embedding in enumerate(embeddings):
             if encoding_format == "base64":

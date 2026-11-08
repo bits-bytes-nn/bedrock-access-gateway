@@ -76,6 +76,23 @@ Parameters:
     Default: 10
     MinValue: 1
     Description: Alarm when the API returns more than this many 5XX responses in one hour.
+  TokenAlarmPerHour:
+    Type: String
+    Default: ""
+    AllowedPattern: ^([1-9][0-9]*)?$
+    Description: Alarm when the gateway's input, output and cache-write tokens in one hour (cache reads excluded) exceed this. Needs AlarmEmail and EnableTokenMetrics "true". Empty (default) creates no alarm. 10000000 is a starting point for one heavy client; adjust it once a few weeks of token metrics exist.
+  EnableTokenMetrics:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Write each call's token counts (input, output, cache read, cache write; by model and in total) as CloudWatch embedded metric format lines to the function log, which CloudWatch Logs turns into custom metrics in TokenMetricsNamespace. The lines carry the model id and counts only. Custom metrics are billed per metric and month (4 per model used plus 4 totals).
+  TokenMetricsNamespace:
+    Type: String
+    Default: BedrockAccessGateway
+    AllowedPattern: ^(?!AWS/)[ -~]{1,255}$
+    Description: CloudWatch namespace of the token metrics. Give each stack in the same account and Region its own namespace, or their totals add up.
   CostTagKey:
     Type: String
     Default: ""
@@ -127,6 +144,19 @@ Conditions:
   HasReservedConcurrency: !Not [!Or [!Equals [!Ref ReservedConcurrency, ""], !Equals [!Ref ReservedConcurrency, "0"]]]
   IsEnhancedSecurityPolicy: !Not [!Equals [!Ref ApiSecurityPolicy, TLS_1_0]]
   HasAccessLogs: !Equals [!Ref EnableAccessLogs, "true"]
+  HasTokenAlarm: !And
+    - !Condition HasAlarmEmail
+    - !Equals [!Ref EnableTokenMetrics, "true"]
+    - !Not [!Equals [!Ref TokenAlarmPerHour, ""]]
+Rules:
+  # Without these the alarm would be skipped, or never see a data point, without notice.
+  TokenAlarmNeedsMetricsAndEmail:
+    RuleCondition: !Not [!Equals [!Ref TokenAlarmPerHour, ""]]
+    Assertions:
+      - Assert: !Equals [!Ref EnableTokenMetrics, "true"]
+        AssertDescription: TokenAlarmPerHour needs EnableTokenMetrics "true".
+      - Assert: !Not [!Equals [!Ref AlarmEmail, ""]]
+        AssertDescription: TokenAlarmPerHour needs AlarmEmail.
 Resources:
   # IAM Role for Lambda
   ProxyApiHandlerServiceRole:
@@ -209,8 +239,12 @@ Resources:
           IMAGE_URL_ALLOWED_HOSTS: !Ref ImageUrlAllowedHosts
           API_ROUTE_PREFIX: /v1
           ALLOWED_ORIGINS: !Ref AllowedOrigins
+          ENABLE_TOKEN_METRICS: !Ref EnableTokenMetrics
+          TOKEN_METRICS_NAMESPACE: !Ref TokenMetricsNamespace
       # Text: the image runs uvicorn directly (no Lambda Python runtime client), so the JSON
       # format would wrap only Lambda's platform lines and leave the application's lines as text.
+      # Each stdout line is one log event as written, which is what lets CloudWatch Logs extract
+      # the token metrics (EnableTokenMetrics) from it.
       LoggingConfig:
         LogFormat: Text
         LogGroup: !Ref ProxyApiHandlerLogGroup
@@ -398,6 +432,50 @@ Resources:
       Period: 3600
       EvaluationPeriods: 1
       Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Bedrock's own token metrics are per model for the whole account and Region, so they also
+  # count other workloads; these come from the gateway's own log (EnableTokenMetrics).
+  TokenAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasTokenAlarm
+    Properties:
+      AlarmDescription: !Sub "More than ${TokenAlarmPerHour} input, output and cache-write tokens through the gateway in an hour: a leaked key, a runaway client or a cache that no longer hits."
+      Metrics:
+        - Id: input
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref TokenMetricsNamespace
+              MetricName: InputTokens
+            Period: 3600
+            Stat: Sum
+        - Id: output
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref TokenMetricsNamespace
+              MetricName: OutputTokens
+            Period: 3600
+            Stat: Sum
+        - Id: cachewrite
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref TokenMetricsNamespace
+              MetricName: CacheWriteTokens
+            Period: 3600
+            Stat: Sum
+        - Id: tokens
+          Label: Billed tokens per hour (cache reads excluded)
+          # Every metrics line carries all three counts, so the series share their data points.
+          Expression: input + output + cachewrite
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: !Ref TokenAlarmPerHour
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlarmTopic]
