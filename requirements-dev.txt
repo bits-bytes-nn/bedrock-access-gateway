@@ -9,3 +9,5 @@ openai==3.28.0
 ruff==0.17.0
 # Lints the CloudFormation templates in deployment/.
 cfn-lint==1.57.2
+# Checks the runtime lock and these pins against known vulnerabilities (CI).
+pip-audit==2.10.1

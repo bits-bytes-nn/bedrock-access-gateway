@@ -12,8 +12,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           # Same version as the Lambda base image.
           python-version: "3.12"
@@ -24,15 +24,62 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: ruff check .
       - run: ruff format --check .
-      - run: pytest --cov=src/api --cov-report=term-missing
+      # The floor sits just below the current coverage (95%), so a drop fails the build.
+      - run: pytest --cov=src/api --cov-report=term-missing --cov-fail-under=93
       - run: cfn-lint deployment/*.template
       # shellcheck is preinstalled on the GitHub-hosted Ubuntu runners.
       - run: shellcheck scripts/*.sh
+      # --no-deps: both files are full pins, and pip-audit does not follow the nested -r line.
+      - run: pip-audit --no-deps --disable-pip -r src/requirements.txt -r requirements-dev.txt
 
-  # Builds the deployed Lambda image (arm64) without pushing it, so a broken base image,
-  # adapter tag or dependency install fails here rather than at deploy time.
+  # Report only: checks the templates against the Well-Architected Security and Reliability
+  # rules of the AWS Guard Rules Registry. Several rules do not apply (Lambda in a VPC, a DLQ
+  # for synchronous calls) or cannot evaluate parameter references, so findings do not fail CI.
+  cfn-guard:
+    runs-on: ubuntu-latest
+    env:
+      GUARD_VERSION: 3.2.1
+      GUARD_SHA256: 09c2b8cfd81d513374a8da89d4805dc55006a3da52bbf598e272022d4d198e94
+      RULES_VERSION: 1.0.2
+      RULES_SHA256: dc21aaad601c673843c299191d864cd9b9db32475b1937d930d6069ddde73296
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cfn-guard and the registry rules
+        run: |
+          curl -fsSLo guard.tar.gz "https://github.com/aws-cloudformation/cloudformation-guard/releases/download/${GUARD_VERSION}/cfn-guard-v3-x86_64-ubuntu-latest.tar.gz"
+          curl -fsSLo rules.zip "https://github.com/aws-cloudformation/aws-guard-rules-registry/releases/download/${RULES_VERSION}/ruleset-build-v${RULES_VERSION}.zip"
+          echo "${GUARD_SHA256}  guard.tar.gz" | sha256sum --check
+          echo "${RULES_SHA256}  rules.zip" | sha256sum --check
+          tar xzf guard.tar.gz
+          unzip -q rules.zip 'output/wa-*.guard' -d rules
+      - name: Validate the templates
+        run: |
+          for rules in rules/output/wa-Security-Pillar.guard rules/output/wa-Reliability-Pillar.guard; do
+            ./cfn-guard-v3-x86_64-ubuntu-latest/cfn-guard validate \
+              --rules "$rules" --data deployment/ --show-summary fail --output-format single-line-summary \
+              || echo "::warning::cfn-guard findings for $(basename "$rules"); see the log"
+          done
+
+  # Builds both images (arm64, as deployed) without pushing them, so a broken base image,
+  # adapter tag or dependency install fails here rather than at deploy time, then checks
+  # that each starts and answers /health with stub settings.
   image:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - run: docker build --file src/Dockerfile src/
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker build --file src/Dockerfile --tag proxy-lambda src/
+      - run: docker build --file src/Dockerfile_ecs --tag proxy-ecs src/
+      - name: Smoke test
+        run: |
+          for image in proxy-lambda proxy-ecs; do
+            # Stub settings: /health needs no AWS call.
+            docker run --detach --name smoke --publish 8080:8080 \
+              --env API_KEY=smoke-test --env AWS_REGION=us-east-1 "$image"
+            if ! curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-all-errors \
+              http://127.0.0.1:8080/health; then
+              docker logs smoke
+              exit 1
+            fi
+            echo " ${image} OK"
+            docker rm --force smoke
+          done
